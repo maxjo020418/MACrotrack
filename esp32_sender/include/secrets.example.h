@@ -17,6 +17,3 @@
 // Development only. Set to 1 to skip TLS certificate verification for HTTPS.
 // Do not use this for production.
 #define HTTP_TLS_INSECURE 0
-
-// Keep serial per-record prints while debugging. Disable once upload is active.
-#define DEBUG_PRINT_RECORDS 1

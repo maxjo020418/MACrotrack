@@ -3,6 +3,7 @@
 #include <SPI.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
+#include <stdarg.h>
 
 extern "C" {
   #include "esp_wifi.h"
@@ -42,9 +43,41 @@ extern "C" {
   #define HTTP_TLS_INSECURE 0
 #endif
 
-#ifndef DEBUG_PRINT_RECORDS
-  #define DEBUG_PRINT_RECORDS 1
-#endif
+enum class LogLevel : uint8_t {
+  Info,
+  Warn,
+  Error,
+};
+
+static const char* logLevelName(LogLevel level) {
+  switch (level) {
+    case LogLevel::Info:
+      return "INFO";
+    case LogLevel::Warn:
+      return "WARN";
+    case LogLevel::Error:
+      return "ERROR";
+    default:
+      return "INFO";
+  }
+}
+
+static void logEvent(LogLevel level, const char* event, const char* format = nullptr, ...) {
+  Serial.printf("%s event=%s", logLevelName(level), event);
+
+  if (format != nullptr && format[0] != '\0') {
+    char details[256];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(details, sizeof(details), format, args);
+    va_end(args);
+
+    Serial.print(' ');
+    Serial.print(details);
+  }
+
+  Serial.println();
+}
 
 // shared SPI bus
 static constexpr int PIN_SPI_SCLK = 18;
@@ -65,23 +98,31 @@ static constexpr uint32_t STATUS_MAGIC = 0x53544154UL;  // "STAT" numeric magic
 static constexpr uint16_t PROTOCOL_VERSION = 1;
 static constexpr uint32_t BATCH_MAGIC = 0x534E5042UL;  // "SNPB" numeric magic
 static constexpr uint16_t BATCH_VERSION = 1;
+static constexpr uint32_t SENDER_STATUS_MAGIC = 0x48544C48UL;  // "HLTH" numeric magic
+static constexpr uint16_t SENDER_STATUS_VERSION = 1;
+static constexpr uint32_t BATCH_FLAG_HAS_SENDER_STATUS = 1 << 0;
+static constexpr size_t STATUS_DEVICE_ID_BYTES = 32;
+static constexpr size_t MAX_BATCH_SNIFFER_STATUS = 2;
 static constexpr size_t RECORD_HEADER_BYTES = 24;
 static constexpr size_t MAX_FRAME_BYTES = 512;
 static constexpr size_t SPI_TRANSFER_BYTES = RECORD_HEADER_BYTES + MAX_FRAME_BYTES;
 static constexpr uint32_t SPI_CLOCK_HZ = 10000000;  // 10Mhz
 static constexpr uint32_t READY_TIMEOUT_MS = 500;
 static constexpr uint32_t READY_REARM_TIMEOUT_MS = 250;
-static constexpr uint32_t STATUS_PRINT_INTERVAL_MS = 2000;
-static constexpr uint32_t UPLOAD_STATUS_INTERVAL_MS = 5000;
-static constexpr size_t UPLOAD_QUEUE_CAPACITY = 64;
-static constexpr size_t MAX_HTTP_BATCH_BYTES = 8192;
+static constexpr uint32_t DEVICE_STATUS_INTERVAL_MS = 1000;
+static constexpr size_t UPLOAD_QUEUE_CAPACITY = 128;
+static constexpr size_t MAX_HTTP_BATCH_BYTES = 16384;
 static constexpr uint32_t MAX_BATCH_RECORDS = 32;
 static constexpr uint32_t FLUSH_INTERVAL_MS = 1000;
+static constexpr uint32_t UPLOAD_RETRY_INTERVAL_MS = 1000;
 static constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
 static constexpr uint32_t WIFI_RECONNECT_INTERVAL_MS = 5000;
 static constexpr uint16_t HTTP_TIMEOUT_MS = 8000;
 
 static constexpr uint16_t FLAG_TRUNCATED = 1 << 0;
+
+static bool uploadWifiEverConnected = false;
+static uint8_t lastWifiDisconnectReason = 0;
 
 typedef struct __attribute__((packed)) {
   uint32_t magic;
@@ -113,14 +154,72 @@ typedef struct __attribute__((packed)) {
 } status_packet_t;
 
 typedef struct __attribute__((packed)) {
+  uint16_t source_id;
+  uint8_t enabled;
+  uint8_t status_seen;
+  uint32_t status_age_ms;
+  uint32_t sender_records_received;
+  uint32_t sender_crc_errors;
+  uint32_t sender_bad_packets;
+  uint32_t sender_spi_errors;
+  uint32_t sender_ready_timeouts;
+  status_packet_t last_status;
+} batch_sniffer_status_t;
+
+typedef struct __attribute__((packed)) {
+  uint32_t magic;        // 0x48544C48 = "HLTH"
+  uint16_t version;      // 1
+  uint16_t struct_len;   // sizeof(sender_status_t)
+  uint32_t uptime_ms;
+  char device_id[STATUS_DEVICE_ID_BYTES];
+  uint32_t heap_size;
+  uint32_t heap_free;
+  uint32_t heap_min_free;
+  uint32_t heap_max_alloc;
+  uint32_t upload_queue_depth;
+  uint32_t upload_queue_capacity;
+  uint32_t upload_queue_max_depth;
+  uint32_t upload_queue_oldest_ms;
+  uint32_t upload_records_queued;
+  uint32_t upload_records_dropped;
+  uint32_t upload_records_batched;
+  uint32_t upload_batches_built;
+  uint32_t upload_dry_run_batches;
+  uint32_t upload_http_attempts;
+  uint32_t upload_http_successes;
+  uint32_t upload_http_failures;
+  uint32_t upload_bytes_sent;
+  uint32_t upload_bytes_dry_run;
+  uint32_t upload_retry_batch_seq;
+  uint32_t upload_retry_records;
+  uint32_t upload_retry_bytes;
+  uint32_t upload_retry_attempts;
+  uint32_t upload_retry_failures;
+  int32_t upload_retry_last_code;
+  uint32_t sender_records_received;
+  uint32_t sender_crc_errors;
+  uint32_t sender_bad_packets;
+  uint32_t sender_spi_errors;
+  uint32_t sender_ready_timeouts;
+  uint8_t upload_enabled;
+  uint8_t wifi_connected;
+  int8_t wifi_rssi;
+  uint8_t upload_retry_pending;
+  uint8_t sniffer_count;
+  uint8_t reserved[3];
+  batch_sniffer_status_t sniffers[MAX_BATCH_SNIFFER_STATUS];
+} sender_status_t;
+
+typedef struct __attribute__((packed)) {
   uint32_t magic;        // 0x534E5042 = "SNPB"
   uint16_t version;      // 1
   uint16_t header_len;   // sizeof(batch_header_t)
   uint32_t batch_seq;
   uint32_t record_count;
-  uint32_t payload_len;  // bytes after this header
+  uint32_t payload_len;  // status_len + record bytes after this header
   uint32_t uptime_ms;
   uint32_t flags;
+  uint32_t status_len;   // bytes of sender_status_t before records
 } batch_header_t;
 
 typedef struct __attribute__((packed)) {
@@ -129,6 +228,13 @@ typedef struct __attribute__((packed)) {
 } upload_record_prefix_t;
 
 static_assert(sizeof(sniff_record_t) == RECORD_HEADER_BYTES, "unexpected record header size");
+static_assert(sizeof(sender_status_t) < MAX_HTTP_BATCH_BYTES, "sender status does not fit upload batch");
+static_assert(sizeof(batch_header_t) +
+                sizeof(sender_status_t) +
+                sizeof(upload_record_prefix_t) +
+                sizeof(sniff_record_t) +
+                MAX_FRAME_BYTES <= MAX_HTTP_BATCH_BYTES,
+              "upload batch cannot fit sender status and one max-sized record");
 
 struct SnifferLink {
   const char* name;
@@ -142,12 +248,14 @@ struct SnifferLink {
   uint32_t badPackets;
   uint32_t spiErrors;
   uint32_t readyTimeouts;
-  uint32_t lastStatusPrintMs;
+  bool statusSeen;
+  status_packet_t lastStatus;
+  uint32_t lastStatusMs;
 };
 
 static SnifferLink sniffers[] = {
-  {"sniffer1", 1, PIN_CS_SNIFFER1, PIN_RDY_SNIFFER1, true, nullptr, 0, 0, 0, 0, 0, 0},
-  {"sniffer2", 2, PIN_CS_SNIFFER2, PIN_RDY_SNIFFER2, false, nullptr, 0, 0, 0, 0, 0, 0},
+  {"sniffer1", 1, PIN_CS_SNIFFER1, PIN_RDY_SNIFFER1, true, nullptr, 0, 0, 0, 0, 0, false, {}, 0},
+  {"sniffer2", 2, PIN_CS_SNIFFER2, PIN_RDY_SNIFFER2, false, nullptr, 0, 0, 0, 0, 0, false, {}, 0},
 };
 
 DRAM_ATTR static uint8_t txBuf[SPI_TRANSFER_BYTES] __attribute__((aligned(4)));
@@ -162,12 +270,12 @@ struct UploadRecord {
 };
 
 static SemaphoreHandle_t uploadQueueMutex = nullptr;
-static UploadRecord uploadQueue[UPLOAD_QUEUE_CAPACITY];
+static UploadRecord* uploadQueue = nullptr;
 static size_t uploadQueueHead = 0;
 static size_t uploadQueueCount = 0;
 static uint16_t uploadQueueMaxDepth = 0;
 
-DRAM_ATTR static uint8_t uploadBatchBuf[MAX_HTTP_BATCH_BYTES] __attribute__((aligned(4)));
+static uint8_t* uploadBatchBuf = nullptr;
 
 static uint32_t uploadRecordsQueued = 0;
 static uint32_t uploadRecordsDropped = 0;
@@ -180,12 +288,55 @@ static uint32_t httpFailures = 0;
 static uint32_t uploadBytesSent = 0;
 static uint32_t uploadBytesDryRun = 0;
 static uint32_t uploadBatchSeq = 1;
-static uint32_t lastUploadStatusMs = 0;
 
-static uint16_t get16(const uint8_t* buf, size_t offset) {
-  return static_cast<uint16_t>(buf[offset]) |
-         (static_cast<uint16_t>(buf[offset + 1]) << 8);
-}
+static bool uploadRetryPending = false;
+static size_t uploadRetryBytes = 0;
+static uint32_t uploadRetryBatchSeq = 0;
+static uint32_t uploadRetryRecordCount = 0;
+static uint32_t uploadRetryAttempts = 0;
+static uint32_t uploadRetryFailures = 0;
+static uint32_t uploadRetryLastAttemptMs = 0;
+static int uploadRetryLastCode = 0;
+
+struct UploadQueueSnapshot {
+  size_t depth;
+  uint16_t maxDepth;
+  uint32_t oldestAgeMs;
+  uint32_t recordsQueued;
+  uint32_t recordsDropped;
+  uint32_t recordsBatched;
+  uint32_t batchesBuilt;
+  uint32_t dryRunBatches;
+  uint32_t httpAttempts;
+  uint32_t httpSuccesses;
+  uint32_t httpFailures;
+  uint32_t bytesSent;
+  uint32_t dryRunBytes;
+};
+
+struct SenderCounterSnapshot {
+  uint32_t recordsReceived;
+  uint32_t crcErrors;
+  uint32_t badPackets;
+  uint32_t spiErrors;
+  uint32_t readyTimeouts;
+};
+
+struct MemorySnapshot {
+  uint32_t heapSize;
+  uint32_t freeHeap;
+  uint32_t minFreeHeap;
+  uint32_t maxAllocHeap;
+  uint8_t heapUsedPct;
+};
+
+static uint32_t lastDeviceStatusMs = 0;
+static SenderCounterSnapshot lastStatusCounters = {};
+static uint32_t lastStatusUploadDropped = 0;
+static bool queueWarnActive = false;
+static bool queueCriticalActive = false;
+static bool heapWarnActive = false;
+static bool heapCriticalActive = false;
 
 static uint32_t get32(const uint8_t* buf, size_t offset) {
   return static_cast<uint32_t>(buf[offset]) |
@@ -223,8 +374,28 @@ static size_t serializedRecordBytes(const UploadRecord& record) {
   return sizeof(upload_record_prefix_t) + record.recordLen;
 }
 
+static bool initUploadBuffers() {
+  uploadQueue = static_cast<UploadRecord*>(malloc(sizeof(UploadRecord) * UPLOAD_QUEUE_CAPACITY));
+  uploadBatchBuf = static_cast<uint8_t*>(malloc(MAX_HTTP_BATCH_BYTES));
+
+  if (uploadQueue == nullptr || uploadBatchBuf == nullptr) {
+    logEvent(LogLevel::Error,
+             "upload_buffer_alloc_failed",
+             "queue_bytes=%u batch_bytes=%u heap_free=%lu max_alloc=%lu",
+             static_cast<unsigned>(sizeof(UploadRecord) * UPLOAD_QUEUE_CAPACITY),
+             static_cast<unsigned>(MAX_HTTP_BATCH_BYTES),
+             static_cast<unsigned long>(ESP.getFreeHeap()),
+             static_cast<unsigned long>(ESP.getMaxAllocHeap()));
+    return false;
+  }
+
+  return true;
+}
+
 static void enqueueUploadRecord(const SnifferLink& sniffer, const sniff_record_t& record, const uint8_t* frame) {
-  if (record.frame_len > MAX_FRAME_BYTES || uploadQueueMutex == nullptr) {
+  if (record.frame_len > MAX_FRAME_BYTES ||
+      uploadQueue == nullptr ||
+      uploadQueueMutex == nullptr) {
     return;
   }
 
@@ -255,31 +426,208 @@ static void enqueueUploadRecord(const SnifferLink& sniffer, const sniff_record_t
   giveUploadMutex();
 }
 
-static bool getUploadQueueSnapshot(size_t* depth, uint32_t* oldestAgeMs) {
-  if (!takeUploadMutex(pdMS_TO_TICKS(10))) {
+static bool getUploadQueueSnapshot(UploadQueueSnapshot* snapshot, TickType_t ticks = pdMS_TO_TICKS(10)) {
+  if (snapshot == nullptr || !takeUploadMutex(ticks)) {
     return false;
   }
 
   const size_t count = uploadQueueCount;
-  *depth = count;
+  snapshot->depth = count;
+  snapshot->maxDepth = uploadQueueMaxDepth;
   if (count == 0) {
-    *oldestAgeMs = 0;
+    snapshot->oldestAgeMs = 0;
   } else {
-    *oldestAgeMs = millis() - uploadQueue[uploadQueueHead].queuedMs;
+    snapshot->oldestAgeMs = millis() - uploadQueue[uploadQueueHead].queuedMs;
   }
+  snapshot->recordsQueued = uploadRecordsQueued;
+  snapshot->recordsDropped = uploadRecordsDropped;
+  snapshot->recordsBatched = uploadRecordsBatched;
+  snapshot->batchesBuilt = uploadBatchesBuilt;
 
   giveUploadMutex();
+
+  snapshot->dryRunBatches = uploadDryRunBatches;
+  snapshot->httpAttempts = httpAttempts;
+  snapshot->httpSuccesses = httpSuccesses;
+  snapshot->httpFailures = httpFailures;
+  snapshot->bytesSent = uploadBytesSent;
+  snapshot->dryRunBytes = uploadBytesDryRun;
   return true;
 }
 
 static bool shouldFlushUploadQueue() {
-  size_t depth = 0;
-  uint32_t oldestAgeMs = 0;
-  if (!getUploadQueueSnapshot(&depth, &oldestAgeMs)) {
+  UploadQueueSnapshot snapshot = {};
+  if (!getUploadQueueSnapshot(&snapshot)) {
     return false;
   }
 
-  return depth >= MAX_BATCH_RECORDS || (depth > 0 && oldestAgeMs >= FLUSH_INTERVAL_MS);
+  return snapshot.depth >= MAX_BATCH_RECORDS ||
+         (snapshot.depth > 0 && snapshot.oldestAgeMs >= FLUSH_INTERVAL_MS);
+}
+
+static SenderCounterSnapshot getSenderCounterSnapshot() {
+  SenderCounterSnapshot snapshot = {};
+  for (const SnifferLink& sniffer : sniffers) {
+    snapshot.recordsReceived += sniffer.recordsReceived;
+    snapshot.crcErrors += sniffer.crcErrors;
+    snapshot.badPackets += sniffer.badPackets;
+    snapshot.spiErrors += sniffer.spiErrors;
+    snapshot.readyTimeouts += sniffer.readyTimeouts;
+  }
+  return snapshot;
+}
+
+static MemorySnapshot getMemorySnapshot() {
+  MemorySnapshot snapshot = {};
+  snapshot.heapSize = ESP.getHeapSize();
+  snapshot.freeHeap = ESP.getFreeHeap();
+  snapshot.minFreeHeap = ESP.getMinFreeHeap();
+  snapshot.maxAllocHeap = ESP.getMaxAllocHeap();
+  if (snapshot.heapSize > 0 && snapshot.freeHeap <= snapshot.heapSize) {
+    snapshot.heapUsedPct = static_cast<uint8_t>(100 - ((snapshot.freeHeap * 100UL) / snapshot.heapSize));
+  }
+  return snapshot;
+}
+
+static void fillSenderStatus(sender_status_t* status,
+                             const UploadQueueSnapshot& queue,
+                             uint32_t now) {
+  if (status == nullptr) {
+    return;
+  }
+
+  memset(status, 0, sizeof(*status));
+
+  const MemorySnapshot memory = getMemorySnapshot();
+  const SenderCounterSnapshot counters = getSenderCounterSnapshot();
+  const bool wifiConnected = WiFi.status() == WL_CONNECTED;
+
+  status->magic = SENDER_STATUS_MAGIC;
+  status->version = SENDER_STATUS_VERSION;
+  status->struct_len = static_cast<uint16_t>(sizeof(sender_status_t));
+  status->uptime_ms = now;
+  strncpy(status->device_id, DEVICE_ID, sizeof(status->device_id) - 1);
+  status->heap_size = memory.heapSize;
+  status->heap_free = memory.freeHeap;
+  status->heap_min_free = memory.minFreeHeap;
+  status->heap_max_alloc = memory.maxAllocHeap;
+  status->upload_queue_depth = static_cast<uint32_t>(queue.depth);
+  status->upload_queue_capacity = static_cast<uint32_t>(UPLOAD_QUEUE_CAPACITY);
+  status->upload_queue_max_depth = queue.maxDepth;
+  status->upload_queue_oldest_ms = queue.oldestAgeMs;
+  status->upload_records_queued = queue.recordsQueued;
+  status->upload_records_dropped = queue.recordsDropped;
+  status->upload_records_batched = queue.recordsBatched;
+  status->upload_batches_built = queue.batchesBuilt;
+  status->upload_dry_run_batches = queue.dryRunBatches;
+  status->upload_http_attempts = queue.httpAttempts;
+  status->upload_http_successes = queue.httpSuccesses;
+  status->upload_http_failures = queue.httpFailures;
+  status->upload_bytes_sent = queue.bytesSent;
+  status->upload_bytes_dry_run = queue.dryRunBytes;
+  status->upload_retry_batch_seq = uploadRetryBatchSeq;
+  status->upload_retry_records = uploadRetryRecordCount;
+  status->upload_retry_bytes = static_cast<uint32_t>(uploadRetryBytes);
+  status->upload_retry_attempts = uploadRetryAttempts;
+  status->upload_retry_failures = uploadRetryFailures;
+  status->upload_retry_last_code = uploadRetryLastCode;
+  status->sender_records_received = counters.recordsReceived;
+  status->sender_crc_errors = counters.crcErrors;
+  status->sender_bad_packets = counters.badPackets;
+  status->sender_spi_errors = counters.spiErrors;
+  status->sender_ready_timeouts = counters.readyTimeouts;
+  status->upload_enabled = UPLOAD_ENABLED ? 1 : 0;
+  status->wifi_connected = wifiConnected ? 1 : 0;
+  status->wifi_rssi = wifiConnected ? static_cast<int8_t>(WiFi.RSSI()) : 0;
+  status->upload_retry_pending = uploadRetryPending ? 1 : 0;
+
+  uint8_t statusIndex = 0;
+  for (const SnifferLink& sniffer : sniffers) {
+    if (statusIndex >= MAX_BATCH_SNIFFER_STATUS) {
+      break;
+    }
+
+    batch_sniffer_status_t& target = status->sniffers[statusIndex++];
+    target.source_id = sniffer.sourceId;
+    target.enabled = sniffer.enabled ? 1 : 0;
+    target.status_seen = sniffer.statusSeen ? 1 : 0;
+    target.status_age_ms = sniffer.statusSeen ? now - sniffer.lastStatusMs : 0xFFFFFFFFUL;
+    target.sender_records_received = sniffer.recordsReceived;
+    target.sender_crc_errors = sniffer.crcErrors;
+    target.sender_bad_packets = sniffer.badPackets;
+    target.sender_spi_errors = sniffer.spiErrors;
+    target.sender_ready_timeouts = sniffer.readyTimeouts;
+    if (sniffer.statusSeen) {
+      target.last_status = sniffer.lastStatus;
+    }
+  }
+  status->sniffer_count = statusIndex;
+}
+
+static void updatePressureWarnings(const UploadQueueSnapshot& queue,
+                                   const MemorySnapshot& memory,
+                                   uint32_t droppedDelta) {
+  const size_t queueWarnDepth = (UPLOAD_QUEUE_CAPACITY * 3) / 4;
+  const size_t queueCriticalDepth = (UPLOAD_QUEUE_CAPACITY * 9) / 10;
+
+  if (queue.depth >= queueCriticalDepth && !queueCriticalActive) {
+    logEvent(LogLevel::Warn,
+             "upload_queue_critical",
+             "depth=%u capacity=%u oldest_ms=%lu dropped=%lu",
+             static_cast<unsigned>(queue.depth),
+             static_cast<unsigned>(UPLOAD_QUEUE_CAPACITY),
+             static_cast<unsigned long>(queue.oldestAgeMs),
+             static_cast<unsigned long>(queue.recordsDropped));
+    queueCriticalActive = true;
+    queueWarnActive = true;
+  } else if (queue.depth >= queueWarnDepth && !queueWarnActive) {
+    logEvent(LogLevel::Warn,
+             "upload_queue_high",
+             "depth=%u capacity=%u oldest_ms=%lu dropped=%lu",
+             static_cast<unsigned>(queue.depth),
+             static_cast<unsigned>(UPLOAD_QUEUE_CAPACITY),
+             static_cast<unsigned long>(queue.oldestAgeMs),
+             static_cast<unsigned long>(queue.recordsDropped));
+    queueWarnActive = true;
+  } else if (queue.depth < queueWarnDepth) {
+    queueWarnActive = false;
+    queueCriticalActive = false;
+  }
+
+  if (droppedDelta > 0) {
+    logEvent(LogLevel::Warn,
+             "upload_records_dropped",
+             "count_1s=%lu total=%lu depth=%u",
+             static_cast<unsigned long>(droppedDelta),
+             static_cast<unsigned long>(queue.recordsDropped),
+             static_cast<unsigned>(queue.depth));
+  }
+
+  static constexpr uint32_t HEAP_WARN_BYTES = 32768;
+  static constexpr uint32_t HEAP_CRITICAL_BYTES = 16384;
+  if (memory.freeHeap < HEAP_CRITICAL_BYTES && !heapCriticalActive) {
+    logEvent(LogLevel::Error,
+             "heap_critical",
+             "free=%lu min_free=%lu max_alloc=%lu used_pct=%u",
+             static_cast<unsigned long>(memory.freeHeap),
+             static_cast<unsigned long>(memory.minFreeHeap),
+             static_cast<unsigned long>(memory.maxAllocHeap),
+             static_cast<unsigned>(memory.heapUsedPct));
+    heapCriticalActive = true;
+    heapWarnActive = true;
+  } else if (memory.freeHeap < HEAP_WARN_BYTES && !heapWarnActive) {
+    logEvent(LogLevel::Warn,
+             "heap_low",
+             "free=%lu min_free=%lu max_alloc=%lu used_pct=%u",
+             static_cast<unsigned long>(memory.freeHeap),
+             static_cast<unsigned long>(memory.minFreeHeap),
+             static_cast<unsigned long>(memory.maxAllocHeap),
+             static_cast<unsigned>(memory.heapUsedPct));
+    heapWarnActive = true;
+  } else if (memory.freeHeap >= (HEAP_WARN_BYTES + 8192)) {
+    heapWarnActive = false;
+    heapCriticalActive = false;
+  }
 }
 
 static bool buildUploadBatch(size_t* batchBytes, uint32_t* batchSeq, uint32_t* recordCount) {
@@ -296,14 +644,38 @@ static bool buildUploadBatch(size_t* batchBytes, uint32_t* batchSeq, uint32_t* r
     return false;
   }
 
+  const uint32_t now = millis();
+  UploadQueueSnapshot queueSnapshot = {};
+  queueSnapshot.depth = uploadQueueCount;
+  queueSnapshot.maxDepth = uploadQueueMaxDepth;
+  queueSnapshot.oldestAgeMs = now - uploadQueue[uploadQueueHead].queuedMs;
+  queueSnapshot.recordsQueued = uploadRecordsQueued;
+  queueSnapshot.recordsDropped = uploadRecordsDropped;
+  queueSnapshot.recordsBatched = uploadRecordsBatched;
+  queueSnapshot.batchesBuilt = uploadBatchesBuilt;
+  queueSnapshot.dryRunBatches = uploadDryRunBatches;
+  queueSnapshot.httpAttempts = httpAttempts;
+  queueSnapshot.httpSuccesses = httpSuccesses;
+  queueSnapshot.httpFailures = httpFailures;
+  queueSnapshot.bytesSent = uploadBytesSent;
+  queueSnapshot.dryRunBytes = uploadBytesDryRun;
+
+  sender_status_t senderStatus = {};
+  fillSenderStatus(&senderStatus, queueSnapshot, now);
+
   batch_header_t header = {};
   header.magic = BATCH_MAGIC;
   header.version = BATCH_VERSION;
-  header.header_len = sizeof(batch_header_t);
+  header.header_len = static_cast<uint16_t>(sizeof(batch_header_t));
   header.batch_seq = uploadBatchSeq++;
-  header.uptime_ms = millis();
+  header.uptime_ms = now;
+  header.flags = BATCH_FLAG_HAS_SENDER_STATUS;
+  header.status_len = sizeof(senderStatus);
 
   size_t offset = sizeof(batch_header_t);
+  memcpy(uploadBatchBuf + offset, &senderStatus, sizeof(senderStatus));
+  offset += sizeof(senderStatus);
+
   uint32_t records = 0;
 
   while (uploadQueueCount > 0 && records < MAX_BATCH_RECORDS) {
@@ -362,148 +734,21 @@ static bool waitReadyLevel(const SnifferLink& sniffer, uint8_t level, uint32_t t
 static bool waitForSlaveRearm(SnifferLink& sniffer) {
   if (!waitReadyLevel(sniffer, LOW, READY_REARM_TIMEOUT_MS)) {
     ++sniffer.readyTimeouts;
-    Serial.printf("%s READY did not drop after transfer\n", sniffer.name);
+    logEvent(LogLevel::Warn, "ready_rearm_timeout", "source=%s phase=drop", sniffer.name);
     return false;
   }
 
   if (!waitReadyLevel(sniffer, HIGH, READY_TIMEOUT_MS)) {
     ++sniffer.readyTimeouts;
-    Serial.printf("%s timeout waiting for READY on GPIO%d\n", sniffer.name, sniffer.readyPin);
+    logEvent(LogLevel::Warn,
+             "ready_rearm_timeout",
+             "source=%s phase=rise gpio=%d",
+             sniffer.name,
+             sniffer.readyPin);
     return false;
   }
 
   return true;
-}
-
-static const char* mgmtSubtypeName(uint8_t subtype) {
-  switch (subtype) {
-    case 0:
-      return "assoc_req";
-    case 1:
-      return "assoc_resp";
-    case 2:
-      return "reassoc_req";
-    case 3:
-      return "reassoc_resp";
-    case 4:
-      return "probe_req";
-    case 5:
-      return "probe_resp";
-    case 8:
-      return "beacon";
-    case 9:
-      return "atim";
-    case 10:
-      return "disassoc";
-    case 11:
-      return "auth";
-    case 12:
-      return "deauth";
-    case 13:
-      return "action";
-    default:
-      return "mgmt";
-  }
-}
-
-static void formatMac(const uint8_t* mac, char* out, size_t outLen) {
-  snprintf(out,
-           outLen,
-           "%02X:%02X:%02X:%02X:%02X:%02X",
-           mac[0],
-           mac[1],
-           mac[2],
-           mac[3],
-           mac[4],
-           mac[5]);
-}
-
-static size_t ieOffsetForSubtype(uint8_t subtype) {
-  switch (subtype) {
-    case 0:   // association request: capability + listen interval
-      return 28;
-    case 1:   // association response: capability + status + AID
-      return 30;
-    case 2:   // reassociation request: association request fixed fields + current AP
-      return 34;
-    case 3:   // reassociation response
-      return 30;
-    case 4:   // probe request
-      return 24;
-    case 5:   // probe response: timestamp + beacon interval + capability
-    case 8:   // beacon: timestamp + beacon interval + capability
-      return 36;
-    default:
-      return 0;
-  }
-}
-
-static void extractSsid(const uint8_t* frame, size_t frameLen, uint8_t subtype, char* out, size_t outLen) {
-  out[0] = '\0';
-  const size_t ieOffset = ieOffsetForSubtype(subtype);
-  if (ieOffset == 0 || ieOffset >= frameLen) {
-    return;
-  }
-
-  size_t pos = ieOffset;
-  while ((pos + 2) <= frameLen) {
-    const uint8_t id = frame[pos];
-    const uint8_t len = frame[pos + 1];
-    pos += 2;
-    if ((pos + len) > frameLen) {
-      return;
-    }
-
-    if (id == 0) {
-      const size_t copyLen = min(static_cast<size_t>(len), outLen - 1);
-      for (size_t i = 0; i < copyLen; ++i) {
-        const uint8_t c = frame[pos + i];
-        out[i] = (c >= 32 && c <= 126) ? static_cast<char>(c) : '.';
-      }
-      out[copyLen] = '\0';
-      return;
-    }
-
-    pos += len;
-  }
-}
-
-static void printRecord(SnifferLink& sniffer, const sniff_record_t& record, const uint8_t* frame) {
-  const uint16_t frameControl = get16(frame, 0);
-  const uint8_t frameType = static_cast<uint8_t>((frameControl >> 2) & 0x03);
-  const uint8_t subtype = static_cast<uint8_t>((frameControl >> 4) & 0x0F);
-
-  char addr1[18] = "--:--:--:--:--:--";
-  char addr2[18] = "--:--:--:--:--:--";
-  char addr3[18] = "--:--:--:--:--:--";
-  if (record.frame_len >= 24) {
-    formatMac(frame + 4, addr1, sizeof(addr1));
-    formatMac(frame + 10, addr2, sizeof(addr2));
-    formatMac(frame + 16, addr3, sizeof(addr3));
-  }
-
-  char ssid[33] = "";
-  extractSsid(frame, record.frame_len, subtype, ssid, sizeof(ssid));
-
-  Serial.printf("%s seq=%lu ts=%lu ch=%u rssi=%d type=%u/%s len=%u%s src=%s dst=%s bssid=%s",
-                sniffer.name,
-                record.seq,
-                record.ts_us,
-                record.channel,
-                record.rssi,
-                frameType,
-                mgmtSubtypeName(subtype),
-                record.frame_len,
-                (record.flags & FLAG_TRUNCATED) != 0 ? " truncated" : "",
-                addr2,
-                addr1,
-                addr3);
-
-  if (ssid[0] != '\0') {
-    Serial.printf(" ssid=\"%s\"", ssid);
-  }
-
-  Serial.println();
 }
 
 static void handleRecord(SnifferLink& sniffer) {
@@ -515,11 +760,13 @@ static void handleRecord(SnifferLink& sniffer) {
       record.frame_len > MAX_FRAME_BYTES ||
       (sizeof(sniff_record_t) + record.frame_len) > SPI_TRANSFER_BYTES) {
     ++sniffer.badPackets;
-    Serial.printf("%s bad SNIF header: version=%u header_len=%u frame_len=%u\n",
-                  sniffer.name,
-                  record.version,
-                  record.header_len,
-                  record.frame_len);
+    logEvent(LogLevel::Warn,
+             "bad_snif_header",
+             "source=%s version=%u header_len=%u frame_len=%u",
+             sniffer.name,
+             record.version,
+             record.header_len,
+             record.frame_len);
     return;
   }
 
@@ -527,46 +774,28 @@ static void handleRecord(SnifferLink& sniffer) {
   const uint16_t crc = crc16CcittFalse(frame, record.frame_len);
   if (crc != record.crc16) {
     ++sniffer.crcErrors;
-    Serial.printf("%s CRC error seq=%lu got=0x%04X expected=0x%04X len=%u\n",
-                  sniffer.name,
-                  record.seq,
-                  crc,
-                  record.crc16,
-                  record.frame_len);
+    logEvent(LogLevel::Warn,
+             "crc_error",
+             "source=%s seq=%lu got=0x%04X expected=0x%04X len=%u",
+             sniffer.name,
+             static_cast<unsigned long>(record.seq),
+             crc,
+             record.crc16,
+             record.frame_len);
     return;
   }
 
   ++sniffer.recordsReceived;
   enqueueUploadRecord(sniffer, record, frame);
-
-#if DEBUG_PRINT_RECORDS
-  printRecord(sniffer, record, frame);
-#endif
 }
 
 static void handleStatus(SnifferLink& sniffer) {
   status_packet_t status = {};
   memcpy(&status, rxBuf, min(sizeof(status), sizeof(rxBuf)));
 
-  const uint32_t now = millis();
-  if ((now - sniffer.lastStatusPrintMs) < STATUS_PRINT_INTERVAL_MS) {
-    return;
-  }
-  sniffer.lastStatusPrintMs = now;
-
-  Serial.printf("%s status: wifi=%s wifi_err=%lu captured=%lu queued=%lu dropped=%lu depth=%u max_depth=%u spi_fail=%lu records_rx=%lu crc_err=%lu bad=%lu\n",
-                sniffer.name,
-                status.wifi_ready != 0 ? "ok" : "not_ready",
-                status.wifi_init_error,
-                status.packets_captured,
-                status.records_queued,
-                status.records_dropped,
-                status.queue_depth,
-                status.max_queue_depth,
-                status.spi_send_failures,
-                sniffer.recordsReceived,
-                sniffer.crcErrors,
-                sniffer.badPackets);
+  sniffer.statusSeen = true;
+  sniffer.lastStatus = status;
+  sniffer.lastStatusMs = millis();
 }
 
 static void handlePacket(SnifferLink& sniffer) {
@@ -582,13 +811,21 @@ static void handlePacket(SnifferLink& sniffer) {
   }
 
   ++sniffer.badPackets;
-  Serial.printf("%s bad SPI packet magic=0x%08lX\n", sniffer.name, magic);
+  logEvent(LogLevel::Warn,
+           "bad_spi_packet",
+           "source=%s magic=0x%08lX",
+           sniffer.name,
+           static_cast<unsigned long>(magic));
 }
 
 static bool pollSniffer(SnifferLink& sniffer) {
   if (!waitReadyLevel(sniffer, HIGH, READY_TIMEOUT_MS)) {
     ++sniffer.readyTimeouts;
-    Serial.printf("%s not ready on GPIO%d\n", sniffer.name, sniffer.readyPin);
+    logEvent(LogLevel::Warn,
+             "ready_timeout",
+             "source=%s gpio=%d",
+             sniffer.name,
+             sniffer.readyPin);
     return false;
   }
 
@@ -603,7 +840,11 @@ static bool pollSniffer(SnifferLink& sniffer) {
   const esp_err_t err = spi_device_transmit(sniffer.device, &transaction);
   if (err != ESP_OK) {
     ++sniffer.spiErrors;
-    Serial.printf("%s spi_device_transmit failed: %d\n", sniffer.name, static_cast<int>(err));
+    logEvent(LogLevel::Error,
+             "spi_transmit_failed",
+             "source=%s err=%d",
+             sniffer.name,
+             static_cast<int>(err));
     return false;
   }
 
@@ -614,6 +855,183 @@ static bool pollSniffer(SnifferLink& sniffer) {
 
 static bool uploadUrlIsHttps() {
   return strncmp(UPLOAD_URL, "https://", 8) == 0;
+}
+
+static const char* wlStatusName(wl_status_t status) {
+  switch (status) {
+    case WL_IDLE_STATUS:
+      return "IDLE";
+    case WL_NO_SSID_AVAIL:
+      return "NO_SSID_AVAIL";
+    case WL_SCAN_COMPLETED:
+      return "SCAN_COMPLETED";
+    case WL_CONNECTED:
+      return "CONNECTED";
+    case WL_CONNECT_FAILED:
+      return "CONNECT_FAILED";
+    case WL_CONNECTION_LOST:
+      return "CONNECTION_LOST";
+    case WL_DISCONNECTED:
+      return "DISCONNECTED";
+    default:
+      return "UNKNOWN";
+  }
+}
+
+static const char* authModeName(wifi_auth_mode_t mode) {
+  switch (mode) {
+    case WIFI_AUTH_OPEN:
+      return "OPEN";
+    case WIFI_AUTH_WEP:
+      return "WEP";
+    case WIFI_AUTH_WPA_PSK:
+      return "WPA_PSK";
+    case WIFI_AUTH_WPA2_PSK:
+      return "WPA2_PSK";
+    case WIFI_AUTH_WPA_WPA2_PSK:
+      return "WPA_WPA2_PSK";
+    case WIFI_AUTH_WPA2_ENTERPRISE:
+      return "WPA2_ENTERPRISE";
+    case WIFI_AUTH_WPA3_PSK:
+      return "WPA3_PSK";
+    case WIFI_AUTH_WPA2_WPA3_PSK:
+      return "WPA2_WPA3_PSK";
+    default:
+      return "UNKNOWN";
+  }
+}
+
+static const char* disconnectReasonName(uint8_t reason) {
+  switch (reason) {
+    case WIFI_REASON_AUTH_EXPIRE:
+      return "AUTH_EXPIRE";
+    case WIFI_REASON_AUTH_LEAVE:
+      return "AUTH_LEAVE";
+    case WIFI_REASON_ASSOC_EXPIRE:
+      return "ASSOC_EXPIRE";
+    case WIFI_REASON_ASSOC_TOOMANY:
+      return "ASSOC_TOOMANY";
+    case WIFI_REASON_NOT_AUTHED:
+      return "NOT_AUTHED";
+    case WIFI_REASON_NOT_ASSOCED:
+      return "NOT_ASSOCED";
+    case WIFI_REASON_ASSOC_LEAVE:
+      return "ASSOC_LEAVE";
+    case WIFI_REASON_ASSOC_NOT_AUTHED:
+      return "ASSOC_NOT_AUTHED";
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+      return "4WAY_HANDSHAKE_TIMEOUT";
+    case WIFI_REASON_HANDSHAKE_TIMEOUT:
+      return "HANDSHAKE_TIMEOUT";
+    case WIFI_REASON_AUTH_FAIL:
+      return "AUTH_FAIL";
+    case WIFI_REASON_ASSOC_FAIL:
+      return "ASSOC_FAIL";
+    case WIFI_REASON_NO_AP_FOUND:
+      return "NO_AP_FOUND";
+    case WIFI_REASON_CONNECTION_FAIL:
+      return "CONNECTION_FAIL";
+    case WIFI_REASON_BEACON_TIMEOUT:
+      return "BEACON_TIMEOUT";
+    default:
+      return "UNKNOWN";
+  }
+}
+
+static String hostFromUrl(const char* url) {
+  String host(url);
+  const int scheme = host.indexOf("://");
+  if (scheme >= 0) {
+    host.remove(0, scheme + 3);
+  }
+
+  const int slash = host.indexOf('/');
+  if (slash >= 0) {
+    host.remove(slash);
+  }
+
+  const int port = host.indexOf(':');
+  if (port >= 0) {
+    host.remove(port);
+  }
+
+  return host;
+}
+
+static void scanForConfiguredSsid() {
+  logEvent(LogLevel::Info, "wifi_scan_start", "target_ssid=\"%s\"", WIFI_SSID);
+  const int count = WiFi.scanNetworks(false, true);
+  if (count < 0) {
+    logEvent(LogLevel::Warn, "wifi_scan_failed", "code=%d", count);
+    return;
+  }
+
+  int matches = 0;
+  logEvent(LogLevel::Info, "wifi_scan_result", "count=%d", count);
+  for (int i = 0; i < count; ++i) {
+    const bool match = WiFi.SSID(i) == WIFI_SSID;
+    if (match) {
+      ++matches;
+    }
+
+    Serial.printf("INFO event=wifi_network index=%d match=%u ssid=\"%s\" rssi=%d channel=%d auth=%s bssid=%s\n",
+                  i,
+                  match ? 1 : 0,
+                  WiFi.SSID(i).c_str(),
+                  WiFi.RSSI(i),
+                  WiFi.channel(i),
+                  authModeName(WiFi.encryptionType(i)),
+                  WiFi.BSSIDstr(i).c_str());
+  }
+
+  if (matches == 0) {
+    logEvent(LogLevel::Warn,
+             "wifi_ssid_not_seen",
+             "ssid=\"%s\" note=\"ESP32 classic WiFi is 2.4GHz only\"",
+             WIFI_SSID);
+  } else {
+    logEvent(LogLevel::Info, "wifi_ssid_seen", "ssid=\"%s\" matches=%d", WIFI_SSID, matches);
+  }
+
+  WiFi.scanDelete();
+}
+
+static void runUploadDnsDiagnostic() {
+  const String host = hostFromUrl(UPLOAD_URL);
+  if (host.length() == 0) {
+    logEvent(LogLevel::Warn, "dns_test_skipped", "reason=empty_host url=%s", UPLOAD_URL);
+    return;
+  }
+
+  IPAddress ip;
+  const int ok = WiFi.hostByName(host.c_str(), ip);
+  if (ok == 1) {
+    logEvent(LogLevel::Info, "dns_ok", "host=%s ip=%s", host.c_str(), ip.toString().c_str());
+  } else {
+    logEvent(LogLevel::Warn, "dns_failed", "host=%s result=%d", host.c_str(), ok);
+  }
+}
+
+static void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+  switch (event) {
+    case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+      logEvent(LogLevel::Info, "wifi_event_connected");
+      break;
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      uploadWifiEverConnected = true;
+      logEvent(LogLevel::Info, "wifi_event_got_ip", "ip=%s", WiFi.localIP().toString().c_str());
+      break;
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      lastWifiDisconnectReason = info.wifi_sta_disconnected.reason;
+      logEvent(LogLevel::Warn,
+               "wifi_event_disconnected",
+               "reason=%u reason_name=%s",
+               static_cast<unsigned>(lastWifiDisconnectReason),
+               disconnectReasonName(lastWifiDisconnectReason));
+      break;
+    default:
+      break;
+  }
 }
 
 static bool uploadConfigLooksUsable() {
@@ -636,48 +1054,103 @@ static bool ensureWifiConnected() {
   lastAttemptMs = now;
 
   if (!uploadConfigLooksUsable()) {
-    Serial.println("upload config missing WIFI_SSID or UPLOAD_URL");
+    logEvent(LogLevel::Warn, "upload_config_missing");
     return false;
   }
 
+  lastWifiDisconnectReason = 0;
   WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(false);
+  WiFi.persistent(false);
+  scanForConfiguredSsid();
+
   WiFi.begin(WIFI_SSID, WIFI_PASS);
 
+  logEvent(LogLevel::Info,
+           "wifi_connect_start",
+           "ssid=\"%s\" timeout_ms=%lu",
+           WIFI_SSID,
+           static_cast<unsigned long>(WIFI_CONNECT_TIMEOUT_MS));
+
   const uint32_t started = millis();
+  uint32_t lastWaitLogMs = 0;
   while (WiFi.status() != WL_CONNECTED && (millis() - started) < WIFI_CONNECT_TIMEOUT_MS) {
-    delay(250);
+    const uint32_t waitNow = millis();
+    if ((waitNow - lastWaitLogMs) >= 1000) {
+      lastWaitLogMs = waitNow;
+      logEvent(LogLevel::Info,
+               "wifi_connect_wait",
+               "elapsed_ms=%lu status=%s last_reason=%u last_reason_name=%s",
+               static_cast<unsigned long>(waitNow - started),
+               wlStatusName(WiFi.status()),
+               static_cast<unsigned>(lastWifiDisconnectReason),
+               disconnectReasonName(lastWifiDisconnectReason));
+    }
+    delay(100);
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("WiFi connected for upload: ip=%s rssi=%d\n",
-                  WiFi.localIP().toString().c_str(),
-                  WiFi.RSSI());
+    uploadWifiEverConnected = true;
+    logEvent(LogLevel::Info,
+             "wifi_connected",
+             "ssid=\"%s\" ip=%s gateway=%s subnet=%s dns=%s rssi=%d channel=%u bssid=%s",
+             WiFi.SSID().c_str(),
+             WiFi.localIP().toString().c_str(),
+             WiFi.gatewayIP().toString().c_str(),
+             WiFi.subnetMask().toString().c_str(),
+             WiFi.dnsIP().toString().c_str(),
+             WiFi.RSSI(),
+             WiFi.channel(),
+             WiFi.BSSIDstr().c_str());
+    runUploadDnsDiagnostic();
     return true;
   }
 
-  Serial.println("WiFi upload connect timed out");
+  logEvent(LogLevel::Warn,
+           "wifi_connect_timeout",
+           "ssid=\"%s\" status=%s last_reason=%u last_reason_name=%s",
+           WIFI_SSID,
+           wlStatusName(WiFi.status()),
+           static_cast<unsigned>(lastWifiDisconnectReason),
+           disconnectReasonName(lastWifiDisconnectReason));
   return false;
 #else
   return false;
 #endif
 }
 
-static bool postBatch(const uint8_t* data, size_t len, uint32_t batchSeq, uint32_t recordCount) {
+static bool postBatch(const uint8_t* data,
+                      size_t len,
+                      uint32_t batchSeq,
+                      uint32_t recordCount,
+                      int* responseCodeOut = nullptr) {
+  if (responseCodeOut != nullptr) {
+    *responseCodeOut = 0;
+  }
+
 #if !UPLOAD_ENABLED
   ++uploadDryRunBatches;
   uploadBytesDryRun += static_cast<uint32_t>(len);
-  Serial.printf("upload dry-run: batch=%lu records=%lu bytes=%u queued=%lu dropped=%lu\n",
-                batchSeq,
-                recordCount,
-                static_cast<unsigned>(len),
-                uploadRecordsQueued,
-                uploadRecordsDropped);
+  if (responseCodeOut != nullptr) {
+    *responseCodeOut = 200;
+  }
   return true;
 #else
   ++httpAttempts;
 
   if (!ensureWifiConnected()) {
     ++httpFailures;
+    if (responseCodeOut != nullptr) {
+      *responseCodeOut = 0;
+    }
+    if (uploadWifiEverConnected) {
+      logEvent(LogLevel::Warn,
+               "upload_batch_failed",
+               "reason=wifi_unavailable code=0 batch=%lu records=%lu bytes=%u",
+               static_cast<unsigned long>(batchSeq),
+               static_cast<unsigned long>(recordCount),
+               static_cast<unsigned>(len));
+    }
     return false;
   }
 
@@ -728,28 +1201,116 @@ static bool postBatch(const uint8_t* data, size_t len, uint32_t batchSeq, uint32
 
   if (!began) {
     ++httpFailures;
-    Serial.println("HTTP begin failed");
+    if (responseCodeOut != nullptr) {
+      *responseCodeOut = responseCode;
+    }
+    logEvent(LogLevel::Warn,
+             "upload_batch_failed",
+             "reason=http_begin_failed code=%d batch=%lu records=%lu bytes=%u",
+             responseCode,
+             static_cast<unsigned long>(batchSeq),
+             static_cast<unsigned long>(recordCount),
+             static_cast<unsigned>(len));
     return false;
   }
 
   if (responseCode >= 200 && responseCode < 300) {
     ++httpSuccesses;
     uploadBytesSent += static_cast<uint32_t>(len);
+    if (responseCodeOut != nullptr) {
+      *responseCodeOut = responseCode;
+    }
     return true;
   }
 
   ++httpFailures;
-  Serial.printf("HTTP upload failed: code=%d batch=%lu records=%lu bytes=%u\n",
-                responseCode,
-                batchSeq,
-                recordCount,
-                static_cast<unsigned>(len));
+  if (responseCodeOut != nullptr) {
+    *responseCodeOut = responseCode;
+  }
+  logEvent(LogLevel::Warn,
+           "upload_batch_failed",
+           "reason=http_status code=%d batch=%lu records=%lu bytes=%u",
+           responseCode,
+           static_cast<unsigned long>(batchSeq),
+           static_cast<unsigned long>(recordCount),
+           static_cast<unsigned>(len));
   return false;
 #endif
 }
 
+static void setPendingUploadBatch(size_t batchBytes, uint32_t batchSeq, uint32_t recordCount) {
+  uploadRetryPending = true;
+  uploadRetryBytes = batchBytes;
+  uploadRetryBatchSeq = batchSeq;
+  uploadRetryRecordCount = recordCount;
+  uploadRetryAttempts = 0;
+  uploadRetryFailures = 0;
+  uploadRetryLastAttemptMs = 0;
+  uploadRetryLastCode = 0;
+}
+
+static void clearPendingUploadBatch() {
+  uploadRetryPending = false;
+  uploadRetryBytes = 0;
+  uploadRetryBatchSeq = 0;
+  uploadRetryRecordCount = 0;
+  uploadRetryAttempts = 0;
+  uploadRetryFailures = 0;
+  uploadRetryLastAttemptMs = 0;
+  uploadRetryLastCode = 0;
+}
+
+static bool attemptPendingUploadBatch() {
+  if (!uploadRetryPending) {
+    return true;
+  }
+
+  uploadRetryLastAttemptMs = millis();
+  ++uploadRetryAttempts;
+
+  int responseCode = 0;
+  const bool uploaded = postBatch(uploadBatchBuf,
+                                  uploadRetryBytes,
+                                  uploadRetryBatchSeq,
+                                  uploadRetryRecordCount,
+                                  &responseCode);
+  uploadRetryLastCode = responseCode;
+
+  if (!uploaded) {
+    ++uploadRetryFailures;
+    return false;
+  }
+
+  if (uploadRetryFailures > 0) {
+    logEvent(LogLevel::Info,
+             "upload_batch_recovered",
+             "batch=%lu records=%lu bytes=%u attempts=%lu failures=%lu code=%d",
+             static_cast<unsigned long>(uploadRetryBatchSeq),
+             static_cast<unsigned long>(uploadRetryRecordCount),
+             static_cast<unsigned>(uploadRetryBytes),
+             static_cast<unsigned long>(uploadRetryAttempts),
+             static_cast<unsigned long>(uploadRetryFailures),
+             responseCode);
+  }
+
+  clearPendingUploadBatch();
+  return true;
+}
+
 static void uploadTask(void*) {
   while (true) {
+    if (uploadRetryPending) {
+      const uint32_t now = millis();
+      if (uploadRetryLastAttemptMs != 0 &&
+          (now - uploadRetryLastAttemptMs) < UPLOAD_RETRY_INTERVAL_MS) {
+        delay(50);
+        continue;
+      }
+
+      attemptPendingUploadBatch();
+      continue;
+    }
+
     if (!shouldFlushUploadQueue()) {
       delay(50);
       continue;
@@ -759,35 +1320,124 @@ static void uploadTask(void*) {
     uint32_t batchSeq = 0;
     uint32_t recordCount = 0;
     if (buildUploadBatch(&batchBytes, &batchSeq, &recordCount)) {
-      postBatch(uploadBatchBuf, batchBytes, batchSeq, recordCount);
+      setPendingUploadBatch(batchBytes, batchSeq, recordCount);
+      attemptPendingUploadBatch();
     }
   }
 }
 
-static void printUploadStatus() {
+static void printDeviceStatus() {
   const uint32_t now = millis();
-  if ((now - lastUploadStatusMs) < UPLOAD_STATUS_INTERVAL_MS) {
+  if ((now - lastDeviceStatusMs) < DEVICE_STATUS_INTERVAL_MS) {
     return;
   }
-  lastUploadStatusMs = now;
 
-  size_t depth = 0;
-  uint32_t oldestAgeMs = 0;
-  getUploadQueueSnapshot(&depth, &oldestAgeMs);
+  const uint32_t elapsedMs = lastDeviceStatusMs == 0 ? now : now - lastDeviceStatusMs;
+  lastDeviceStatusMs = now;
 
-  Serial.printf("upload status: enabled=%u queue=%u oldest_ms=%lu queued=%lu dropped=%lu batched=%lu batches=%lu dry_batches=%lu http_ok=%lu http_fail=%lu bytes_sent=%lu dry_bytes=%lu\n",
+#if UPLOAD_ENABLED
+  if (!uploadWifiEverConnected) {
+    UploadQueueSnapshot quietQueue = {};
+    if (getUploadQueueSnapshot(&quietQueue)) {
+      lastStatusUploadDropped = quietQueue.recordsDropped;
+    }
+    lastStatusCounters = getSenderCounterSnapshot();
+    return;
+  }
+#endif
+
+  UploadQueueSnapshot queue = {};
+  if (!getUploadQueueSnapshot(&queue)) {
+    logEvent(LogLevel::Warn, "upload_queue_snapshot_failed");
+    return;
+  }
+
+  const MemorySnapshot memory = getMemorySnapshot();
+  const SenderCounterSnapshot counters = getSenderCounterSnapshot();
+
+  const uint32_t rxDelta = counters.recordsReceived - lastStatusCounters.recordsReceived;
+  const uint32_t crcDelta = counters.crcErrors - lastStatusCounters.crcErrors;
+  const uint32_t badDelta = counters.badPackets - lastStatusCounters.badPackets;
+  const uint32_t spiErrorDelta = counters.spiErrors - lastStatusCounters.spiErrors;
+  const uint32_t readyTimeoutDelta = counters.readyTimeouts - lastStatusCounters.readyTimeouts;
+  const uint32_t droppedDelta = queue.recordsDropped - lastStatusUploadDropped;
+
+  updatePressureWarnings(queue, memory, droppedDelta);
+
+  Serial.printf("INFO event=device_status uptime_ms=%lu elapsed_ms=%lu upload_enabled=%u heap_free=%lu heap_min_free=%lu heap_max_alloc=%lu heap_used_pct=%u upload_depth=%u upload_capacity=%u upload_oldest_ms=%lu upload_max_depth=%u upload_queued=%lu upload_dropped=%lu upload_dropped_1s=%lu upload_batched=%lu upload_batches=%lu upload_dry_batches=%lu http_attempt=%lu http_ok=%lu http_fail=%lu retry_pending=%u retry_batch=%lu retry_records=%lu retry_bytes=%u retry_attempts=%lu retry_failures=%lu retry_code=%d bytes_sent=%lu dry_bytes=%lu rx_1s=%lu rx_total=%lu crc_1s=%lu bad_1s=%lu spi_err_1s=%lu ready_timeout_1s=%lu\n",
+                static_cast<unsigned long>(now),
+                static_cast<unsigned long>(elapsedMs),
                 static_cast<unsigned>(UPLOAD_ENABLED),
-                static_cast<unsigned>(depth),
-                oldestAgeMs,
-                uploadRecordsQueued,
-                uploadRecordsDropped,
-                uploadRecordsBatched,
-                uploadBatchesBuilt,
-                uploadDryRunBatches,
-                httpSuccesses,
-                httpFailures,
-                uploadBytesSent,
-                uploadBytesDryRun);
+                static_cast<unsigned long>(memory.freeHeap),
+                static_cast<unsigned long>(memory.minFreeHeap),
+                static_cast<unsigned long>(memory.maxAllocHeap),
+                static_cast<unsigned>(memory.heapUsedPct),
+                static_cast<unsigned>(queue.depth),
+                static_cast<unsigned>(UPLOAD_QUEUE_CAPACITY),
+                static_cast<unsigned long>(queue.oldestAgeMs),
+                static_cast<unsigned>(queue.maxDepth),
+                static_cast<unsigned long>(queue.recordsQueued),
+                static_cast<unsigned long>(queue.recordsDropped),
+                static_cast<unsigned long>(droppedDelta),
+                static_cast<unsigned long>(queue.recordsBatched),
+                static_cast<unsigned long>(queue.batchesBuilt),
+                static_cast<unsigned long>(queue.dryRunBatches),
+                static_cast<unsigned long>(queue.httpAttempts),
+                static_cast<unsigned long>(queue.httpSuccesses),
+                static_cast<unsigned long>(queue.httpFailures),
+                static_cast<unsigned>(uploadRetryPending ? 1 : 0),
+                static_cast<unsigned long>(uploadRetryBatchSeq),
+                static_cast<unsigned long>(uploadRetryRecordCount),
+                static_cast<unsigned>(uploadRetryBytes),
+                static_cast<unsigned long>(uploadRetryAttempts),
+                static_cast<unsigned long>(uploadRetryFailures),
+                uploadRetryLastCode,
+                static_cast<unsigned long>(queue.bytesSent),
+                static_cast<unsigned long>(queue.dryRunBytes),
+                static_cast<unsigned long>(rxDelta),
+                static_cast<unsigned long>(counters.recordsReceived),
+                static_cast<unsigned long>(crcDelta),
+                static_cast<unsigned long>(badDelta),
+                static_cast<unsigned long>(spiErrorDelta),
+                static_cast<unsigned long>(readyTimeoutDelta));
+
+  for (const SnifferLink& sniffer : sniffers) {
+    if (!sniffer.enabled) {
+      continue;
+    }
+
+    if (!sniffer.statusSeen) {
+      Serial.printf("INFO event=sniffer_status source=%s status_seen=0 sender_rx=%lu sender_crc=%lu sender_bad=%lu sender_spi_err=%lu sender_ready_timeout=%lu\n",
+                    sniffer.name,
+                    static_cast<unsigned long>(sniffer.recordsReceived),
+                    static_cast<unsigned long>(sniffer.crcErrors),
+                    static_cast<unsigned long>(sniffer.badPackets),
+                    static_cast<unsigned long>(sniffer.spiErrors),
+                    static_cast<unsigned long>(sniffer.readyTimeouts));
+      continue;
+    }
+
+    const uint32_t statusAgeMs = now - sniffer.lastStatusMs;
+    const status_packet_t& status = sniffer.lastStatus;
+    Serial.printf("INFO event=sniffer_status source=%s age_ms=%lu wifi=%u captured=%lu queued=%lu dropped=%lu depth=%u max_depth=%u spi_send_failures=%lu sender_rx=%lu sender_crc=%lu sender_bad=%lu sender_spi_err=%lu sender_ready_timeout=%lu\n",
+                  sniffer.name,
+                  static_cast<unsigned long>(statusAgeMs),
+                  static_cast<unsigned>(status.wifi_ready),
+                  static_cast<unsigned long>(status.packets_captured),
+                  static_cast<unsigned long>(status.records_queued),
+                  static_cast<unsigned long>(status.records_dropped),
+                  static_cast<unsigned>(status.queue_depth),
+                  static_cast<unsigned>(status.max_queue_depth),
+                  static_cast<unsigned long>(status.spi_send_failures),
+                  static_cast<unsigned long>(sniffer.recordsReceived),
+                  static_cast<unsigned long>(sniffer.crcErrors),
+                  static_cast<unsigned long>(sniffer.badPackets),
+                  static_cast<unsigned long>(sniffer.spiErrors),
+                  static_cast<unsigned long>(sniffer.readyTimeouts));
+  }
+
+  lastStatusCounters = counters;
+  lastStatusUploadDropped = queue.recordsDropped;
 }
 
 static bool initSpiMasterBus() {
@@ -805,7 +1455,7 @@ static bool initSpiMasterBus() {
   const esp_err_t err = spi_bus_initialize(SPI_HOST_DEVICE, &busConfig, 1);
 #endif
   if (err != ESP_OK) {
-    Serial.printf("spi_bus_initialize failed: %d\n", static_cast<int>(err));
+    logEvent(LogLevel::Error, "spi_bus_initialize_failed", "err=%d", static_cast<int>(err));
     return false;
   }
 
@@ -821,7 +1471,11 @@ static bool addSnifferDevice(SnifferLink& sniffer) {
 
   const esp_err_t err = spi_bus_add_device(SPI_HOST_DEVICE, &deviceConfig, &sniffer.device);
   if (err != ESP_OK) {
-    Serial.printf("%s spi_bus_add_device failed: %d\n", sniffer.name, static_cast<int>(err));
+    logEvent(LogLevel::Error,
+             "spi_bus_add_device_failed",
+             "source=%s err=%d",
+             sniffer.name,
+             static_cast<int>(err));
     return false;
   }
 
@@ -832,14 +1486,24 @@ void setup() {
   Serial.begin(115200);
   delay(800);
 
+#if UPLOAD_ENABLED
+  WiFi.onEvent(onWiFiEvent);
+#endif
+
 #if !UPLOAD_ENABLED
   WiFi.mode(WIFI_OFF);
   esp_wifi_stop();
 #endif
 
+  if (!initUploadBuffers()) {
+    while (true) {
+      delay(1000);
+    }
+  }
+
   uploadQueueMutex = xSemaphoreCreateMutex();
   if (uploadQueueMutex == nullptr) {
-    Serial.println("upload queue mutex init failed");
+    logEvent(LogLevel::Error, "upload_queue_mutex_init_failed");
     while (true) {
       delay(1000);
     }
@@ -854,25 +1518,28 @@ void setup() {
   pinMode(PIN_RDY_SNIFFER2, INPUT_PULLDOWN);
 
   if (!initSpiMasterBus()) {
-    Serial.println("SPI master init failed. Test halted.");
+    logEvent(LogLevel::Error, "spi_master_init_failed");
     while (true) {
       delay(1000);
     }
   }
 
-  Serial.println("ESP32 sender SPI poller starting.");
-  Serial.printf("SPI clock=%lu Hz transfer=%u bytes max_frame=%u bytes\n",
-                SPI_CLOCK_HZ,
-                static_cast<unsigned>(SPI_TRANSFER_BYTES),
-                static_cast<unsigned>(MAX_FRAME_BYTES));
-  Serial.printf("Uploader: enabled=%u url=%s device=%s queue=%u batch_max=%u records_per_batch=%lu debug_print=%u\n",
-                static_cast<unsigned>(UPLOAD_ENABLED),
-                UPLOAD_URL,
-                DEVICE_ID,
-                static_cast<unsigned>(UPLOAD_QUEUE_CAPACITY),
-                static_cast<unsigned>(MAX_HTTP_BATCH_BYTES),
-                MAX_BATCH_RECORDS,
-                static_cast<unsigned>(DEBUG_PRINT_RECORDS));
+  logEvent(LogLevel::Info,
+           "sender_starting",
+           "spi_clock=%lu transfer_bytes=%u max_frame=%u",
+           static_cast<unsigned long>(SPI_CLOCK_HZ),
+           static_cast<unsigned>(SPI_TRANSFER_BYTES),
+           static_cast<unsigned>(MAX_FRAME_BYTES));
+  logEvent(LogLevel::Info,
+           "uploader_config",
+           "enabled=%u url=%s device=%s queue=%u batch_max=%u records_per_batch=%lu status_len=%u",
+           static_cast<unsigned>(UPLOAD_ENABLED),
+           UPLOAD_URL,
+           DEVICE_ID,
+           static_cast<unsigned>(UPLOAD_QUEUE_CAPACITY),
+           static_cast<unsigned>(MAX_HTTP_BATCH_BYTES),
+           static_cast<unsigned long>(MAX_BATCH_RECORDS),
+           static_cast<unsigned>(sizeof(sender_status_t)));
 
   for (SnifferLink& sniffer : sniffers) {
     if (!sniffer.enabled) {
@@ -892,7 +1559,7 @@ void setup() {
                                               nullptr,
                                               0);
   if (taskOk != pdPASS) {
-    Serial.println("upload task start failed");
+    logEvent(LogLevel::Error, "upload_task_start_failed");
   }
 }
 
@@ -905,6 +1572,6 @@ void loop() {
     pollSniffer(sniffer);
   }
 
-  printUploadStatus();
+  printDeviceStatus();
   delay(1);
 }
