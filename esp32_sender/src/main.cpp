@@ -110,9 +110,10 @@ static constexpr uint32_t SPI_CLOCK_HZ = 10000000;  // 10Mhz
 static constexpr uint32_t READY_TIMEOUT_MS = 500;
 static constexpr uint32_t READY_REARM_TIMEOUT_MS = 250;
 static constexpr uint32_t DEVICE_STATUS_INTERVAL_MS = 1000;
-static constexpr size_t UPLOAD_QUEUE_CAPACITY = 128;
-static constexpr size_t MAX_HTTP_BATCH_BYTES = 16384;
-static constexpr uint32_t MAX_BATCH_RECORDS = 32;
+static constexpr size_t UPLOAD_QUEUE_CAPACITY = 384;
+static constexpr size_t UPLOAD_FRAME_QUEUE_BYTES = 65536;
+static constexpr size_t MAX_HTTP_BATCH_BYTES = 24576;
+static constexpr uint32_t MAX_BATCH_RECORDS = 64;
 static constexpr uint32_t FLUSH_INTERVAL_MS = 1000;
 static constexpr uint32_t UPLOAD_RETRY_INTERVAL_MS = 1000;
 static constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
@@ -265,17 +266,29 @@ struct UploadRecord {
   uint16_t sourceId;
   uint16_t recordLen;
   uint32_t queuedMs;
+  uint32_t frameOffset;
   sniff_record_t header;
-  uint8_t frame[MAX_FRAME_BYTES];
 };
 
 static SemaphoreHandle_t uploadQueueMutex = nullptr;
 static UploadRecord* uploadQueue = nullptr;
+static uint8_t* uploadFrameQueue = nullptr;
 static size_t uploadQueueHead = 0;
 static size_t uploadQueueCount = 0;
+static size_t uploadFrameHead = 0;
+static size_t uploadFrameTail = 0;
+static uint32_t uploadFrameBytes = 0;
+static uint32_t uploadFrameMaxBytes = 0;
 static uint16_t uploadQueueMaxDepth = 0;
 
 static uint8_t* uploadBatchBuf = nullptr;
+
+static HTTPClient uploadHttp;
+static WiFiClient uploadPlainClient;
+static WiFiClientSecure uploadSecureClient;
+static bool uploadHttpBegun = false;
+static bool uploadHttpSecure = false;
+static bool uploadHttpResetRequested = false;
 
 static uint32_t uploadRecordsQueued = 0;
 static uint32_t uploadRecordsDropped = 0;
@@ -285,6 +298,10 @@ static uint32_t uploadDryRunBatches = 0;
 static uint32_t httpAttempts = 0;
 static uint32_t httpSuccesses = 0;
 static uint32_t httpFailures = 0;
+static uint32_t httpClientBegins = 0;
+static uint32_t httpClientReuses = 0;
+static uint32_t httpLastMs = 0;
+static uint32_t httpMaxMs = 0;
 static uint32_t uploadBytesSent = 0;
 static uint32_t uploadBytesDryRun = 0;
 static uint32_t uploadBatchSeq = 1;
@@ -306,10 +323,16 @@ struct UploadQueueSnapshot {
   uint32_t recordsDropped;
   uint32_t recordsBatched;
   uint32_t batchesBuilt;
+  uint32_t frameBytes;
+  uint32_t frameMaxBytes;
   uint32_t dryRunBatches;
   uint32_t httpAttempts;
   uint32_t httpSuccesses;
   uint32_t httpFailures;
+  uint32_t httpClientBegins;
+  uint32_t httpClientReuses;
+  uint32_t httpLastMs;
+  uint32_t httpMaxMs;
   uint32_t bytesSent;
   uint32_t dryRunBytes;
 };
@@ -376,13 +399,15 @@ static size_t serializedRecordBytes(const UploadRecord& record) {
 
 static bool initUploadBuffers() {
   uploadQueue = static_cast<UploadRecord*>(malloc(sizeof(UploadRecord) * UPLOAD_QUEUE_CAPACITY));
+  uploadFrameQueue = static_cast<uint8_t*>(malloc(UPLOAD_FRAME_QUEUE_BYTES));
   uploadBatchBuf = static_cast<uint8_t*>(malloc(MAX_HTTP_BATCH_BYTES));
 
-  if (uploadQueue == nullptr || uploadBatchBuf == nullptr) {
+  if (uploadQueue == nullptr || uploadFrameQueue == nullptr || uploadBatchBuf == nullptr) {
     logEvent(LogLevel::Error,
              "upload_buffer_alloc_failed",
-             "queue_bytes=%u batch_bytes=%u heap_free=%lu max_alloc=%lu",
+             "queue_bytes=%u frame_bytes=%u batch_bytes=%u heap_free=%lu max_alloc=%lu",
              static_cast<unsigned>(sizeof(UploadRecord) * UPLOAD_QUEUE_CAPACITY),
+             static_cast<unsigned>(UPLOAD_FRAME_QUEUE_BYTES),
              static_cast<unsigned>(MAX_HTTP_BATCH_BYTES),
              static_cast<unsigned long>(ESP.getFreeHeap()),
              static_cast<unsigned long>(ESP.getMaxAllocHeap()));
@@ -392,9 +417,95 @@ static bool initUploadBuffers() {
   return true;
 }
 
+static bool findFrameQueueSpace(size_t len, size_t* offset) {
+  if (offset == nullptr || len > UPLOAD_FRAME_QUEUE_BYTES) {
+    return false;
+  }
+
+  if (uploadQueueCount == 0) {
+    uploadFrameHead = 0;
+    uploadFrameTail = 0;
+    *offset = 0;
+    return true;
+  }
+
+  if (len == 0) {
+    *offset = uploadFrameTail;
+    return true;
+  }
+
+  if (uploadFrameTail == uploadFrameHead) {
+    return false;
+  }
+
+  if (uploadFrameTail > uploadFrameHead) {
+    const size_t endSpace = UPLOAD_FRAME_QUEUE_BYTES - uploadFrameTail;
+    if (endSpace >= len) {
+      *offset = uploadFrameTail;
+      return true;
+    }
+    if (uploadFrameHead > len) {
+      *offset = 0;
+      return true;
+    }
+    return false;
+  }
+
+  if ((uploadFrameHead - uploadFrameTail) > len) {
+    *offset = uploadFrameTail;
+    return true;
+  }
+
+  return false;
+}
+
+static void commitFrameQueueWrite(size_t offset, size_t len) {
+  if (len == 0) {
+    return;
+  }
+
+  uploadFrameTail = offset + len;
+  if (uploadFrameTail >= UPLOAD_FRAME_QUEUE_BYTES) {
+    uploadFrameTail = 0;
+  }
+
+  uploadFrameBytes += static_cast<uint32_t>(len);
+  if (uploadFrameBytes > uploadFrameMaxBytes) {
+    uploadFrameMaxBytes = uploadFrameBytes;
+  }
+}
+
+static bool discardOldestUploadRecord(bool countAsDropped) {
+  if (uploadQueueCount == 0) {
+    return false;
+  }
+
+  const UploadRecord& record = uploadQueue[uploadQueueHead];
+  const uint32_t frameLen = record.header.frame_len;
+  uploadFrameBytes = uploadFrameBytes > frameLen ? uploadFrameBytes - frameLen : 0;
+
+  uploadQueueHead = (uploadQueueHead + 1) % UPLOAD_QUEUE_CAPACITY;
+  --uploadQueueCount;
+  if (countAsDropped) {
+    ++uploadRecordsDropped;
+  }
+
+  if (uploadQueueCount == 0) {
+    uploadFrameHead = 0;
+    uploadFrameTail = 0;
+    uploadFrameBytes = 0;
+  } else {
+    uploadFrameHead = uploadQueue[uploadQueueHead].frameOffset;
+  }
+
+  return true;
+}
+
 static void enqueueUploadRecord(const SnifferLink& sniffer, const sniff_record_t& record, const uint8_t* frame) {
   if (record.frame_len > MAX_FRAME_BYTES ||
+      record.frame_len > UPLOAD_FRAME_QUEUE_BYTES ||
       uploadQueue == nullptr ||
+      uploadFrameQueue == nullptr ||
       uploadQueueMutex == nullptr) {
     return;
   }
@@ -403,19 +514,25 @@ static void enqueueUploadRecord(const SnifferLink& sniffer, const sniff_record_t
     return;
   }
 
-  if (uploadQueueCount == UPLOAD_QUEUE_CAPACITY) {
-    uploadQueueHead = (uploadQueueHead + 1) % UPLOAD_QUEUE_CAPACITY;
-    --uploadQueueCount;
-    ++uploadRecordsDropped;
+  size_t frameOffset = 0;
+  while (uploadQueueCount == UPLOAD_QUEUE_CAPACITY ||
+         !findFrameQueueSpace(record.frame_len, &frameOffset)) {
+    if (!discardOldestUploadRecord(true)) {
+      giveUploadMutex();
+      return;
+    }
   }
+
+  memcpy(uploadFrameQueue + frameOffset, frame, record.frame_len);
+  commitFrameQueueWrite(frameOffset, record.frame_len);
 
   const size_t writeIndex = (uploadQueueHead + uploadQueueCount) % UPLOAD_QUEUE_CAPACITY;
   UploadRecord& queued = uploadQueue[writeIndex];
   queued.sourceId = sniffer.sourceId;
   queued.recordLen = static_cast<uint16_t>(sizeof(sniff_record_t) + record.frame_len);
   queued.queuedMs = millis();
+  queued.frameOffset = static_cast<uint32_t>(frameOffset);
   queued.header = record;
-  memcpy(queued.frame, frame, record.frame_len);
 
   ++uploadQueueCount;
   ++uploadRecordsQueued;
@@ -443,6 +560,8 @@ static bool getUploadQueueSnapshot(UploadQueueSnapshot* snapshot, TickType_t tic
   snapshot->recordsDropped = uploadRecordsDropped;
   snapshot->recordsBatched = uploadRecordsBatched;
   snapshot->batchesBuilt = uploadBatchesBuilt;
+  snapshot->frameBytes = uploadFrameBytes;
+  snapshot->frameMaxBytes = uploadFrameMaxBytes;
 
   giveUploadMutex();
 
@@ -450,6 +569,10 @@ static bool getUploadQueueSnapshot(UploadQueueSnapshot* snapshot, TickType_t tic
   snapshot->httpAttempts = httpAttempts;
   snapshot->httpSuccesses = httpSuccesses;
   snapshot->httpFailures = httpFailures;
+  snapshot->httpClientBegins = httpClientBegins;
+  snapshot->httpClientReuses = httpClientReuses;
+  snapshot->httpLastMs = httpLastMs;
+  snapshot->httpMaxMs = httpMaxMs;
   snapshot->bytesSent = uploadBytesSent;
   snapshot->dryRunBytes = uploadBytesDryRun;
   return true;
@@ -569,27 +692,33 @@ static void updatePressureWarnings(const UploadQueueSnapshot& queue,
                                    uint32_t droppedDelta) {
   const size_t queueWarnDepth = (UPLOAD_QUEUE_CAPACITY * 3) / 4;
   const size_t queueCriticalDepth = (UPLOAD_QUEUE_CAPACITY * 9) / 10;
+  const uint32_t frameWarnBytes = (UPLOAD_FRAME_QUEUE_BYTES * 3) / 4;
+  const uint32_t frameCriticalBytes = (UPLOAD_FRAME_QUEUE_BYTES * 9) / 10;
 
-  if (queue.depth >= queueCriticalDepth && !queueCriticalActive) {
+  if ((queue.depth >= queueCriticalDepth || queue.frameBytes >= frameCriticalBytes) && !queueCriticalActive) {
     logEvent(LogLevel::Warn,
              "upload_queue_critical",
-             "depth=%u capacity=%u oldest_ms=%lu dropped=%lu",
+             "depth=%u capacity=%u frame_bytes=%lu frame_capacity=%u oldest_ms=%lu dropped=%lu",
              static_cast<unsigned>(queue.depth),
              static_cast<unsigned>(UPLOAD_QUEUE_CAPACITY),
+             static_cast<unsigned long>(queue.frameBytes),
+             static_cast<unsigned>(UPLOAD_FRAME_QUEUE_BYTES),
              static_cast<unsigned long>(queue.oldestAgeMs),
              static_cast<unsigned long>(queue.recordsDropped));
     queueCriticalActive = true;
     queueWarnActive = true;
-  } else if (queue.depth >= queueWarnDepth && !queueWarnActive) {
+  } else if ((queue.depth >= queueWarnDepth || queue.frameBytes >= frameWarnBytes) && !queueWarnActive) {
     logEvent(LogLevel::Warn,
              "upload_queue_high",
-             "depth=%u capacity=%u oldest_ms=%lu dropped=%lu",
+             "depth=%u capacity=%u frame_bytes=%lu frame_capacity=%u oldest_ms=%lu dropped=%lu",
              static_cast<unsigned>(queue.depth),
              static_cast<unsigned>(UPLOAD_QUEUE_CAPACITY),
+             static_cast<unsigned long>(queue.frameBytes),
+             static_cast<unsigned>(UPLOAD_FRAME_QUEUE_BYTES),
              static_cast<unsigned long>(queue.oldestAgeMs),
              static_cast<unsigned long>(queue.recordsDropped));
     queueWarnActive = true;
-  } else if (queue.depth < queueWarnDepth) {
+  } else if (queue.depth < queueWarnDepth && queue.frameBytes < frameWarnBytes) {
     queueWarnActive = false;
     queueCriticalActive = false;
   }
@@ -597,10 +726,11 @@ static void updatePressureWarnings(const UploadQueueSnapshot& queue,
   if (droppedDelta > 0) {
     logEvent(LogLevel::Warn,
              "upload_records_dropped",
-             "count_1s=%lu total=%lu depth=%u",
+             "count_1s=%lu total=%lu depth=%u frame_bytes=%lu",
              static_cast<unsigned long>(droppedDelta),
              static_cast<unsigned long>(queue.recordsDropped),
-             static_cast<unsigned>(queue.depth));
+             static_cast<unsigned>(queue.depth),
+             static_cast<unsigned long>(queue.frameBytes));
   }
 
   static constexpr uint32_t HEAP_WARN_BYTES = 32768;
@@ -653,10 +783,16 @@ static bool buildUploadBatch(size_t* batchBytes, uint32_t* batchSeq, uint32_t* r
   queueSnapshot.recordsDropped = uploadRecordsDropped;
   queueSnapshot.recordsBatched = uploadRecordsBatched;
   queueSnapshot.batchesBuilt = uploadBatchesBuilt;
+  queueSnapshot.frameBytes = uploadFrameBytes;
+  queueSnapshot.frameMaxBytes = uploadFrameMaxBytes;
   queueSnapshot.dryRunBatches = uploadDryRunBatches;
   queueSnapshot.httpAttempts = httpAttempts;
   queueSnapshot.httpSuccesses = httpSuccesses;
   queueSnapshot.httpFailures = httpFailures;
+  queueSnapshot.httpClientBegins = httpClientBegins;
+  queueSnapshot.httpClientReuses = httpClientReuses;
+  queueSnapshot.httpLastMs = httpLastMs;
+  queueSnapshot.httpMaxMs = httpMaxMs;
   queueSnapshot.bytesSent = uploadBytesSent;
   queueSnapshot.dryRunBytes = uploadBytesDryRun;
 
@@ -692,11 +828,10 @@ static bool buildUploadBatch(size_t* batchBytes, uint32_t* batchSeq, uint32_t* r
     offset += sizeof(prefix);
     memcpy(uploadBatchBuf + offset, &record.header, sizeof(record.header));
     offset += sizeof(record.header);
-    memcpy(uploadBatchBuf + offset, record.frame, record.header.frame_len);
+    memcpy(uploadBatchBuf + offset, uploadFrameQueue + record.frameOffset, record.header.frame_len);
     offset += record.header.frame_len;
 
-    uploadQueueHead = (uploadQueueHead + 1) % UPLOAD_QUEUE_CAPACITY;
-    --uploadQueueCount;
+    discardOldestUploadRecord(false);
     ++records;
   }
 
@@ -855,6 +990,95 @@ static bool pollSniffer(SnifferLink& sniffer) {
 
 static bool uploadUrlIsHttps() {
   return strncmp(UPLOAD_URL, "https://", 8) == 0;
+}
+
+static void closeUploadHttpClient() {
+  if (uploadHttpBegun) {
+    uploadHttp.setReuse(false);
+    uploadHttp.end();
+  }
+
+  uploadPlainClient.stop();
+  uploadSecureClient.stop();
+  uploadHttpBegun = false;
+  uploadHttpSecure = false;
+  uploadHttpResetRequested = false;
+}
+
+static void updateHttpTiming(uint32_t uploadMs) {
+  httpLastMs = uploadMs;
+  if (uploadMs > httpMaxMs) {
+    httpMaxMs = uploadMs;
+  }
+}
+
+static bool beginUploadHttpClient(bool* reused) {
+  if (reused != nullptr) {
+    *reused = false;
+  }
+
+  if (uploadHttpResetRequested) {
+    closeUploadHttpClient();
+  }
+
+  const bool https = uploadUrlIsHttps();
+  if (uploadHttpBegun) {
+    if (uploadHttpSecure != https) {
+      closeUploadHttpClient();
+    } else {
+      if (reused != nullptr && uploadHttp.connected()) {
+        *reused = true;
+      }
+      return true;
+    }
+  }
+
+  bool began = false;
+  if (https) {
+#if HTTP_TLS_INSECURE
+    uploadSecureClient.setInsecure();
+#endif
+    began = uploadHttp.begin(uploadSecureClient, UPLOAD_URL);
+  } else {
+    began = uploadHttp.begin(uploadPlainClient, UPLOAD_URL);
+  }
+
+  if (!began) {
+    closeUploadHttpClient();
+    return false;
+  }
+
+  uploadHttpBegun = true;
+  uploadHttpSecure = https;
+  ++httpClientBegins;
+  uploadHttp.setReuse(true);
+  uploadHttp.setTimeout(HTTP_TIMEOUT_MS);
+  uploadHttp.setConnectTimeout(HTTP_TIMEOUT_MS);
+  return true;
+}
+
+static void addUploadHttpHeaders(uint32_t batchSeq, uint32_t recordCount) {
+  uploadHttp.addHeader("Content-Type", "application/octet-stream");
+  if (strlen(API_TOKEN) > 0) {
+    String bearer = "Bearer ";
+    bearer += API_TOKEN;
+    uploadHttp.addHeader("Authorization", bearer);
+  }
+  uploadHttp.addHeader("X-Device-Id", DEVICE_ID);
+  uploadHttp.addHeader("X-Batch-Version", String(BATCH_VERSION));
+  uploadHttp.addHeader("X-Batch-Seq", String(batchSeq));
+  uploadHttp.addHeader("X-Record-Count", String(recordCount));
+}
+
+static void drainUploadHttpResponseBody() {
+  if (!uploadHttp.connected()) {
+    return;
+  }
+
+  const int responseBytes = uploadHttp.getSize();
+  if (responseBytes > 0) {
+    uploadHttp.getString();
+  }
 }
 
 static const char* wlStatusName(wl_status_t status) {
@@ -1023,6 +1247,7 @@ static void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
       break;
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
       lastWifiDisconnectReason = info.wifi_sta_disconnected.reason;
+      uploadHttpResetRequested = true;
       logEvent(LogLevel::Warn,
                "wifi_event_disconnected",
                "reason=%u reason_name=%s",
@@ -1045,6 +1270,8 @@ static bool ensureWifiConnected() {
   if (WiFi.status() == WL_CONNECTED) {
     return true;
   }
+
+  closeUploadHttpClient();
 
   static uint32_t lastAttemptMs = 0;
   const uint32_t now = millis();
@@ -1154,65 +1381,42 @@ static bool postBatch(const uint8_t* data,
     return false;
   }
 
-  HTTPClient http;
   int responseCode = -1;
-  bool began = false;
-
-  if (uploadUrlIsHttps()) {
-    WiFiClientSecure client;
-#if HTTP_TLS_INSECURE
-    client.setInsecure();
-#endif
-    began = http.begin(client, UPLOAD_URL);
-    if (began) {
-      http.setTimeout(HTTP_TIMEOUT_MS);
-      http.addHeader("Content-Type", "application/octet-stream");
-      if (strlen(API_TOKEN) > 0) {
-        String bearer = "Bearer ";
-        bearer += API_TOKEN;
-        http.addHeader("Authorization", bearer);
-      }
-      http.addHeader("X-Device-Id", DEVICE_ID);
-      http.addHeader("X-Batch-Version", String(BATCH_VERSION));
-      http.addHeader("X-Batch-Seq", String(batchSeq));
-      http.addHeader("X-Record-Count", String(recordCount));
-      responseCode = http.POST(const_cast<uint8_t*>(data), len);
-      http.end();
-    }
-  } else {
-    WiFiClient client;
-    began = http.begin(client, UPLOAD_URL);
-    if (began) {
-      http.setTimeout(HTTP_TIMEOUT_MS);
-      http.addHeader("Content-Type", "application/octet-stream");
-      if (strlen(API_TOKEN) > 0) {
-        String bearer = "Bearer ";
-        bearer += API_TOKEN;
-        http.addHeader("Authorization", bearer);
-      }
-      http.addHeader("X-Device-Id", DEVICE_ID);
-      http.addHeader("X-Batch-Version", String(BATCH_VERSION));
-      http.addHeader("X-Batch-Seq", String(batchSeq));
-      http.addHeader("X-Record-Count", String(recordCount));
-      responseCode = http.POST(const_cast<uint8_t*>(data), len);
-      http.end();
-    }
-  }
+  bool reused = false;
+  const uint32_t uploadStartedMs = millis();
+  const bool began = beginUploadHttpClient(&reused);
 
   if (!began) {
+    const uint32_t uploadMs = millis() - uploadStartedMs;
+    updateHttpTiming(uploadMs);
     ++httpFailures;
     if (responseCodeOut != nullptr) {
       *responseCodeOut = responseCode;
     }
     logEvent(LogLevel::Warn,
              "upload_batch_failed",
-             "reason=http_begin_failed code=%d batch=%lu records=%lu bytes=%u",
+             "reason=http_begin_failed code=%d error=\"%s\" batch=%lu records=%lu bytes=%u upload_ms=%lu",
              responseCode,
+             responseCode < 0 ? HTTPClient::errorToString(responseCode).c_str() : "",
              static_cast<unsigned long>(batchSeq),
              static_cast<unsigned long>(recordCount),
-             static_cast<unsigned>(len));
+             static_cast<unsigned>(len),
+             static_cast<unsigned long>(uploadMs));
     return false;
   }
+
+  if (reused) {
+    ++httpClientReuses;
+  }
+
+  addUploadHttpHeaders(batchSeq, recordCount);
+  responseCode = uploadHttp.POST(const_cast<uint8_t*>(data), len);
+  if (responseCode > 0) {
+    drainUploadHttpResponseBody();
+  }
+
+  const uint32_t uploadMs = millis() - uploadStartedMs;
+  updateHttpTiming(uploadMs);
 
   if (responseCode >= 200 && responseCode < 300) {
     ++httpSuccesses;
@@ -1227,13 +1431,19 @@ static bool postBatch(const uint8_t* data,
   if (responseCodeOut != nullptr) {
     *responseCodeOut = responseCode;
   }
+  if (responseCode < 0) {
+    closeUploadHttpClient();
+  }
   logEvent(LogLevel::Warn,
            "upload_batch_failed",
-           "reason=http_status code=%d batch=%lu records=%lu bytes=%u",
+           "reason=http_status code=%d error=\"%s\" batch=%lu records=%lu bytes=%u upload_ms=%lu reused=%u",
            responseCode,
+           responseCode < 0 ? HTTPClient::errorToString(responseCode).c_str() : "",
            static_cast<unsigned long>(batchSeq),
            static_cast<unsigned long>(recordCount),
-           static_cast<unsigned>(len));
+           static_cast<unsigned>(len),
+           static_cast<unsigned long>(uploadMs),
+           static_cast<unsigned>(reused ? 1 : 0));
   return false;
 #endif
 }
@@ -1284,13 +1494,14 @@ static bool attemptPendingUploadBatch() {
   if (uploadRetryFailures > 0) {
     logEvent(LogLevel::Info,
              "upload_batch_recovered",
-             "batch=%lu records=%lu bytes=%u attempts=%lu failures=%lu code=%d",
+             "batch=%lu records=%lu bytes=%u attempts=%lu failures=%lu code=%d upload_ms=%lu",
              static_cast<unsigned long>(uploadRetryBatchSeq),
              static_cast<unsigned long>(uploadRetryRecordCount),
              static_cast<unsigned>(uploadRetryBytes),
              static_cast<unsigned long>(uploadRetryAttempts),
              static_cast<unsigned long>(uploadRetryFailures),
-             responseCode);
+             responseCode,
+             static_cast<unsigned long>(httpLastMs));
   }
 
   clearPendingUploadBatch();
@@ -1364,7 +1575,7 @@ static void printDeviceStatus() {
 
   updatePressureWarnings(queue, memory, droppedDelta);
 
-  Serial.printf("INFO event=device_status uptime_ms=%lu elapsed_ms=%lu upload_enabled=%u heap_free=%lu heap_min_free=%lu heap_max_alloc=%lu heap_used_pct=%u upload_depth=%u upload_capacity=%u upload_oldest_ms=%lu upload_max_depth=%u upload_queued=%lu upload_dropped=%lu upload_dropped_1s=%lu upload_batched=%lu upload_batches=%lu upload_dry_batches=%lu http_attempt=%lu http_ok=%lu http_fail=%lu retry_pending=%u retry_batch=%lu retry_records=%lu retry_bytes=%u retry_attempts=%lu retry_failures=%lu retry_code=%d bytes_sent=%lu dry_bytes=%lu rx_1s=%lu rx_total=%lu crc_1s=%lu bad_1s=%lu spi_err_1s=%lu ready_timeout_1s=%lu\n",
+  Serial.printf("INFO event=device_status uptime_ms=%lu elapsed_ms=%lu upload_enabled=%u heap_free=%lu heap_min_free=%lu heap_max_alloc=%lu heap_used_pct=%u upload_depth=%u upload_capacity=%u upload_frame_bytes=%lu upload_frame_capacity=%u upload_frame_max=%lu upload_oldest_ms=%lu upload_max_depth=%u upload_queued=%lu upload_dropped=%lu upload_dropped_1s=%lu upload_batched=%lu upload_batches=%lu upload_dry_batches=%lu http_attempt=%lu http_ok=%lu http_fail=%lu http_connects=%lu http_reuse=%lu http_last_ms=%lu http_max_ms=%lu retry_pending=%u retry_batch=%lu retry_records=%lu retry_bytes=%u retry_attempts=%lu retry_failures=%lu retry_code=%d bytes_sent=%lu dry_bytes=%lu rx_1s=%lu rx_total=%lu crc_1s=%lu bad_1s=%lu spi_err_1s=%lu ready_timeout_1s=%lu\n",
                 static_cast<unsigned long>(now),
                 static_cast<unsigned long>(elapsedMs),
                 static_cast<unsigned>(UPLOAD_ENABLED),
@@ -1374,6 +1585,9 @@ static void printDeviceStatus() {
                 static_cast<unsigned>(memory.heapUsedPct),
                 static_cast<unsigned>(queue.depth),
                 static_cast<unsigned>(UPLOAD_QUEUE_CAPACITY),
+                static_cast<unsigned long>(queue.frameBytes),
+                static_cast<unsigned>(UPLOAD_FRAME_QUEUE_BYTES),
+                static_cast<unsigned long>(queue.frameMaxBytes),
                 static_cast<unsigned long>(queue.oldestAgeMs),
                 static_cast<unsigned>(queue.maxDepth),
                 static_cast<unsigned long>(queue.recordsQueued),
@@ -1385,6 +1599,10 @@ static void printDeviceStatus() {
                 static_cast<unsigned long>(queue.httpAttempts),
                 static_cast<unsigned long>(queue.httpSuccesses),
                 static_cast<unsigned long>(queue.httpFailures),
+                static_cast<unsigned long>(queue.httpClientBegins),
+                static_cast<unsigned long>(queue.httpClientReuses),
+                static_cast<unsigned long>(queue.httpLastMs),
+                static_cast<unsigned long>(queue.httpMaxMs),
                 static_cast<unsigned>(uploadRetryPending ? 1 : 0),
                 static_cast<unsigned long>(uploadRetryBatchSeq),
                 static_cast<unsigned long>(uploadRetryRecordCount),
@@ -1532,11 +1750,13 @@ void setup() {
            static_cast<unsigned>(MAX_FRAME_BYTES));
   logEvent(LogLevel::Info,
            "uploader_config",
-           "enabled=%u url=%s device=%s queue=%u batch_max=%u records_per_batch=%lu status_len=%u",
+           "enabled=%u url=%s device=%s tls_insecure=%u queue=%u frame_queue_bytes=%u batch_max=%u records_per_batch=%lu status_len=%u",
            static_cast<unsigned>(UPLOAD_ENABLED),
            UPLOAD_URL,
            DEVICE_ID,
+           static_cast<unsigned>(HTTP_TLS_INSECURE),
            static_cast<unsigned>(UPLOAD_QUEUE_CAPACITY),
+           static_cast<unsigned>(UPLOAD_FRAME_QUEUE_BYTES),
            static_cast<unsigned>(MAX_HTTP_BATCH_BYTES),
            static_cast<unsigned long>(MAX_BATCH_RECORDS),
            static_cast<unsigned>(sizeof(sender_status_t)));

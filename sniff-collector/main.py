@@ -382,6 +382,82 @@ def parse_batch_payload(data: bytes) -> dict[str, Any]:
     return parsed
 
 
+def packet_summary(
+    request: Request,
+    body: bytes,
+    parsed: dict[str, Any] | None,
+    parse_error: str | None,
+) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "client": request.client.host if request.client else None,
+        "bytes": len(body),
+        "sha256": hashlib.sha256(body).hexdigest()[:16],
+        "content_type": request.headers.get("content-type"),
+        "device_id_header": request.headers.get("x-device-id"),
+        "batch_seq_header": request.headers.get("x-batch-seq"),
+        "record_count_header": request.headers.get("x-record-count"),
+        "parsed": parsed is not None,
+        "parse_error": parse_error,
+    }
+
+    if parsed is None:
+        return summary
+
+    header = parsed["header"]
+    summary["batch"] = {
+        "seq": header["batch_seq"],
+        "version": header["version"],
+        "magic_ok": header["magic_ok"],
+        "version_ok": header["version_ok"],
+        "uptime_ms": header["uptime_ms"],
+        "payload_bytes": header["payload_len"],
+        "body_len_ok": parsed["body_len_matches_header"],
+        "declared_records": header["record_count"],
+        "parsed_records": parsed["parsed_record_count"],
+        "unparsed_payload_bytes": parsed["unparsed_payload_bytes"],
+        "trailing_body_bytes": parsed["trailing_body_bytes"],
+    }
+
+    if sender_status := parsed.get("sender_status"):
+        summary["sender"] = {
+            "device_id": sender_status.get("device_id"),
+            "uptime_ms": sender_status.get("uptime_ms"),
+            "wifi_connected": bool(sender_status.get("wifi_connected")),
+            "wifi_rssi": sender_status.get("wifi_rssi"),
+            "heap_free": sender_status.get("heap_free"),
+            "queue_depth": sender_status.get("upload_queue_depth"),
+            "queue_capacity": sender_status.get("upload_queue_capacity"),
+            "records_queued": sender_status.get("upload_records_queued"),
+            "records_dropped": sender_status.get("upload_records_dropped"),
+            "http_attempts": sender_status.get("upload_http_attempts"),
+            "http_successes": sender_status.get("upload_http_successes"),
+            "http_failures": sender_status.get("upload_http_failures"),
+            "retry_pending": bool(sender_status.get("upload_retry_pending")),
+            "sniffer_count": sender_status.get("sniffer_count"),
+        }
+
+    records = []
+    for record in parsed["records"]:
+        record_header = record["header"]
+        records.append(
+            {
+                "index": record["index"],
+                "source_id": record["source_id"],
+                "seq": record_header["seq"],
+                "ts_us": record_header["ts_us"],
+                "channel": record_header["channel"],
+                "rssi": record_header["rssi"],
+                "frame_len": record_header["frame_len"],
+                "frame_len_ok": record["frame_len_matches_header"],
+                "crc16": f"0x{record_header['crc16']:04x}",
+                "truncated": bool(record_header["flags"] & 1),
+                "magic_ok": record_header["magic_ok"],
+            }
+        )
+    summary["records"] = records
+    return summary
+
+
 def sanitize_headers(headers: dict[str, str]) -> dict[str, str]:
     return {
         key: ("<redacted>" if key.lower() in SENSITIVE_HEADERS else value)
@@ -474,23 +550,6 @@ async def receive_sniff_batch(
             detail=f"body is {len(body)} bytes; max is {settings.max_body_bytes}",
         )
 
-    request_info: dict[str, Any] = {
-        "client": {
-            "host": request.client.host if request.client else None,
-            "port": request.client.port if request.client else None,
-        },
-        "method": request.method,
-        "path": request.url.path,
-        "query": str(request.url.query),
-        "content_type": request.headers.get("content-type"),
-        "device_id_header": request.headers.get("x-device-id"),
-        "batch_seq_header": request.headers.get("x-batch-seq"),
-        "record_count_header": request.headers.get("x-record-count"),
-        "body": bytes_summary(body),
-    }
-    if settings.log_headers:
-        request_info["headers"] = sanitize_headers(dict(request.headers))
-
     try:
         parsed = parse_batch_payload(body)
         parse_error = None
@@ -498,20 +557,15 @@ async def receive_sniff_batch(
         parsed = None
         parse_error = str(exc)
 
-    print_event(
-        "sniff_batch_received",
-        {
-            "request": request_info,
-            "parsed": parsed,
-            "parse_error": parse_error,
-        },
-    )
+    summary = packet_summary(request, body, parsed, parse_error)
+    print_event("sniff_batch_received", summary)
 
     return {
         "ok": True,
         "bytes_received": len(body),
         "parsed": parsed is not None,
         "parse_error": parse_error,
+        "summary": summary,
     }
 
 
