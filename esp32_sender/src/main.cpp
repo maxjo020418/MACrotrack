@@ -107,6 +107,8 @@ static constexpr size_t RECORD_HEADER_BYTES = 24;
 static constexpr size_t MAX_FRAME_BYTES = 512;
 static constexpr size_t SPI_TRANSFER_BYTES = RECORD_HEADER_BYTES + MAX_FRAME_BYTES;
 static constexpr uint32_t SPI_CLOCK_HZ = 10000000;  // 10Mhz
+static constexpr uint32_t SPI_CS_SETUP_US = 10;
+static constexpr uint32_t SPI_CS_HOLD_US = 2;
 static constexpr uint32_t READY_TIMEOUT_MS = 500;
 static constexpr uint32_t READY_REARM_TIMEOUT_MS = 250;
 static constexpr uint32_t DEVICE_STATUS_INTERVAL_MS = 1000;
@@ -972,7 +974,12 @@ static bool pollSniffer(SnifferLink& sniffer) {
   transaction.tx_buffer = txBuf;
   transaction.rx_buffer = rxBuf;
 
+  digitalWrite(sniffer.csPin, LOW);
+  delayMicroseconds(SPI_CS_SETUP_US);
   const esp_err_t err = spi_device_transmit(sniffer.device, &transaction);
+  delayMicroseconds(SPI_CS_HOLD_US);
+  digitalWrite(sniffer.csPin, HIGH);
+
   if (err != ESP_OK) {
     ++sniffer.spiErrors;
     logEvent(LogLevel::Error,
@@ -1684,7 +1691,7 @@ static bool addSnifferDevice(SnifferLink& sniffer) {
   spi_device_interface_config_t deviceConfig = {};
   deviceConfig.clock_speed_hz = static_cast<int>(SPI_CLOCK_HZ);
   deviceConfig.mode = SPI_MODE0;
-  deviceConfig.spics_io_num = sniffer.csPin;
+  deviceConfig.spics_io_num = -1;
   deviceConfig.queue_size = 1;
 
   const esp_err_t err = spi_bus_add_device(SPI_HOST_DEVICE, &deviceConfig, &sniffer.device);
