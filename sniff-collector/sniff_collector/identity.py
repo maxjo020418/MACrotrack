@@ -35,7 +35,7 @@ def upsert_mac(conn: Any, raw_mac: bytes | None, now: datetime) -> int | None:
     if raw_mac is None:
         return None
 
-    mac_hash = keyed_hash("MAC", settings.mac_hash_key, raw_mac)
+    mac_hash = keyed_hash("MAC", settings.resolved_mac_hash_key, raw_mac)
     multicast = is_multicast_mac(raw_mac)
     local_admin = is_local_admin_mac(raw_mac)
     oui = raw_mac[:3] if not multicast and not local_admin else None
@@ -69,7 +69,6 @@ def upsert_mac(conn: Any, raw_mac: bytes | None, now: datetime) -> int | None:
 def ssid_values(ssid: bytes | None) -> tuple[bytes | None, str | None]:
     if ssid is None:
         return None, None
-    ssid_hash = keyed_hash("SSID", settings.ssid_hash_key, ssid)
+    ssid_hash = keyed_hash("SSID", settings.resolved_ssid_hash_key, ssid)
     ssid_text = ssid.decode("utf-8", errors="replace") if settings.store_plaintext_ssids else None
     return ssid_hash, ssid_text
-
