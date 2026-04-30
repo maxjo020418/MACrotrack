@@ -1,0 +1,17 @@
+apiVersion: 1
+
+datasources:
+  - name: MACrotrack PostgreSQL
+    uid: macrotrack-postgres
+    type: postgres
+    access: proxy
+    url: postgres:5432
+    user: ${GRAFANA_DB_USER}
+    secureJsonData:
+      password: ${GRAFANA_DB_PASSWORD}
+    jsonData:
+      database: ${POSTGRES_DB}
+      sslmode: disable
+      postgresVersion: 1600
+      timescaledb: false
+    editable: true

@@ -1,0 +1,95 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-macrotrack}
+      POSTGRES_USER: ${POSTGRES_USER:-macrotrack}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      GRAFANA_DB_USER: ${GRAFANA_DB_USER:-grafana_reader}
+      GRAFANA_DB_PASSWORD: ${GRAFANA_DB_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  sniff-collector:
+    build:
+      context: ../sniff-collector
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      COLLECTOR_HOST: 0.0.0.0
+      COLLECTOR_PORT: 8080
+      COLLECTOR_LOG_LEVEL: ${COLLECTOR_LOG_LEVEL:-info}
+      COLLECTOR_API_TOKENS: ${COLLECTOR_API_TOKENS}
+      COLLECTOR_AUTH_REQUIRED: ${COLLECTOR_AUTH_REQUIRED:-true}
+      COLLECTOR_MAX_BODY_BYTES: ${COLLECTOR_MAX_BODY_BYTES:-262144}
+      COLLECTOR_HEX_PREVIEW_BYTES: ${COLLECTOR_HEX_PREVIEW_BYTES:-128}
+      COLLECTOR_LOG_HEADERS: ${COLLECTOR_LOG_HEADERS:-true}
+      COLLECTOR_LOG_RAW_BODY: ${COLLECTOR_LOG_RAW_BODY:-false}
+      COLLECTOR_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-macrotrack}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-macrotrack}
+      COLLECTOR_AUTO_CREATE_SCHEMA: ${COLLECTOR_AUTO_CREATE_SCHEMA:-true}
+      COLLECTOR_STORE_RAW_BODY: ${COLLECTOR_STORE_RAW_BODY:-false}
+      COLLECTOR_STORE_RAW_FRAMES: ${COLLECTOR_STORE_RAW_FRAMES:-true}
+      COLLECTOR_STORE_RAW_MACS: ${COLLECTOR_STORE_RAW_MACS:-false}
+      COLLECTOR_STORE_PLAINTEXT_SSIDS: ${COLLECTOR_STORE_PLAINTEXT_SSIDS:-false}
+      COLLECTOR_MAC_HASH_KEY: ${COLLECTOR_MAC_HASH_KEY}
+      COLLECTOR_SSID_HASH_KEY: ${COLLECTOR_SSID_HASH_KEY}
+    ports:
+      - "${COLLECTOR_PUBLIC_PORT:-8080}:8080"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3).read()",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  grafana:
+    image: grafana/grafana-oss:12.1.0
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      sniff-collector:
+        condition: service_started
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      POSTGRES_DB: ${POSTGRES_DB:-macrotrack}
+      GRAFANA_DB_USER: ${GRAFANA_DB_USER:-grafana_reader}
+      GRAFANA_DB_PASSWORD: ${GRAFANA_DB_PASSWORD}
+    ports:
+      - "${GRAFANA_PUBLIC_PORT:-3000}:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget -q --spider http://127.0.0.1:3000/api/health || exit 1",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  postgres_data:
+  grafana_data:

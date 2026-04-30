@@ -5,6 +5,9 @@ MACrotrack is split across two ESP32 firmware projects:
 - `esp32_sniffer`: captures WiFi management frames and serves them over SPI as a slave.
 - `esp32_sender`: acts as the SPI master, receives sniffer records, batches them, and optionally uploads them to an HTTP endpoint.
 
+For the planned packet collection database behind the temporary `sniff-collector`
+server, see `docs/SNIFF_COLLECTOR_DB_PLAN.md`.
+
 The current implementation is designed around one sender and one sniffer, but the SPI bus layout and sender data model already leave room for multiple sniffers.
 
 ## Data Flow
