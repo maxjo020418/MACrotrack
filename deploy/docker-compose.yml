@@ -12,7 +12,7 @@ services:
       - postgres_data:/var/lib/postgresql/data
       - ./deploy/postgres/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      test: ["CMD", "pg_isready", "-U", "${SERVICE_USER_POSTGRES}", "-d", "${POSTGRES_DB:-macrotrack}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -47,8 +47,8 @@ services:
       COLLECTOR_STORE_PLAINTEXT_SSIDS: ${COLLECTOR_STORE_PLAINTEXT_SSIDS:-false}
       COLLECTOR_MAC_HASH_KEY: ${SERVICE_PASSWORD_COLLECTOR_MAC_HASH_KEY}
       COLLECTOR_SSID_HASH_KEY: ${SERVICE_PASSWORD_COLLECTOR_SSID_HASH_KEY}
-    ports:
-      - "${COLLECTOR_PUBLIC_PORT:-8888}:${COLLECTOR_PORT:-8888}"
+    expose:
+      - "${COLLECTOR_PORT:-8888}"
     healthcheck:
       test:
         [
@@ -78,8 +78,8 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-macrotrack}
       GRAFANA_DB_USER: ${SERVICE_USER_GRAFANA_DB}
       GRAFANA_DB_PASSWORD: ${SERVICE_PASSWORD_GRAFANA_DB}
-    ports:
-      - "${GRAFANA_PUBLIC_PORT:-3000}:3000"
+    expose:
+      - "3000"
     volumes:
       - grafana_data:/var/lib/grafana
       - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
