@@ -63,7 +63,9 @@ services:
       retries: 3
 
   grafana:
-    image: grafana/grafana-oss:12.1.0
+    build:
+      context: deploy/grafana
+      dockerfile: Dockerfile
     restart: unless-stopped
     depends_on:
       postgres:
@@ -87,8 +89,6 @@ services:
       - "${GRAFANA_PUBLIC_PORT}:3000"
     volumes:
       - grafana_data:/var/lib/grafana
-      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
     healthcheck:
       test:
         [
