@@ -4,12 +4,15 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-macrotrack}
-      POSTGRES_USER: ${SERVICE_USER_POSTGRES}
-      POSTGRES_PASSWORD: ${SERVICE_PASSWORD_POSTGRES}
-      GRAFANA_DB_USER: ${SERVICE_USER_GRAFANA_DB}
-      GRAFANA_DB_PASSWORD: ${SERVICE_PASSWORD_GRAFANA_DB}
+      SERVICE_USER_POSTGRES: ${SERVICE_USER_POSTGRES}
+      SERVICE_PASSWORD_POSTGRES: ${SERVICE_PASSWORD_POSTGRES}
+      SERVICE_USER_GRAFANA_DB: ${SERVICE_USER_GRAFANA_DB}
+      SERVICE_PASSWORD_GRAFANA_DB: ${SERVICE_PASSWORD_GRAFANA_DB}
+    entrypoint: ["/bin/sh", "/macrotrack-postgres-entrypoint.sh"]
+    command: ["postgres"]
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./deploy/postgres/entrypoint.sh:/macrotrack-postgres-entrypoint.sh:ro
       - ./deploy/postgres/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "${SERVICE_USER_POSTGRES}", "-d", "${POSTGRES_DB:-macrotrack}"]
