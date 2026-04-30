@@ -6,13 +6,12 @@ ENV UV_LINK_MODE=copy
 
 WORKDIR /app
 
-COPY pyproject.toml uv.lock README.md ./
+COPY sniff-collector/pyproject.toml sniff-collector/uv.lock sniff-collector/README.md ./
 RUN uv sync --frozen --no-dev
 
-COPY main.py ./
-COPY sniff_collector ./sniff_collector
+COPY sniff-collector/main.py ./
+COPY sniff-collector/sniff_collector ./sniff_collector
 
 EXPOSE 8080
 
 CMD ["uv", "run", "--frozen", "python", "main.py"]
-
