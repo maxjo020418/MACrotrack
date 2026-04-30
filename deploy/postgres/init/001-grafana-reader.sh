@@ -1,8 +1,8 @@
 #!/bin/sh
 set -eu
 
-if [ -z "${GRAFANA_DB_PASSWORD:-}" ]; then
-  echo "GRAFANA_DB_PASSWORD is required for the Grafana read-only database role" >&2
+if [ -z "${SERVICE_PASSWORD_GRAFANA_DB:-}" ]; then
+  echo "SERVICE_PASSWORD_GRAFANA_DB is required for the Grafana read-only database role" >&2
   exit 1
 fi
 
@@ -12,8 +12,8 @@ psql \
   -v ON_ERROR_STOP=1 \
   -v db_name="$POSTGRES_DB" \
   -v app_user="$POSTGRES_USER" \
-  -v grafana_user="${GRAFANA_DB_USER:-grafana_reader}" \
-  -v grafana_password="$GRAFANA_DB_PASSWORD" <<'EOSQL'
+  -v grafana_user="$SERVICE_USER_GRAFANA_DB" \
+  -v grafana_password="$SERVICE_PASSWORD_GRAFANA_DB" <<'EOSQL'
 SELECT format('CREATE ROLE %I LOGIN PASSWORD %L', :'grafana_user', :'grafana_password')
 WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'grafana_user') \gexec
 
