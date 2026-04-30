@@ -19,8 +19,8 @@ services:
 
   sniff-collector:
     build:
-      context: ..
-      dockerfile: sniff-collector/Dockerfile
+      context: sniff-collector
+      dockerfile: Dockerfile
     restart: unless-stopped
     depends_on:
       postgres:
