@@ -69,6 +69,8 @@ services:
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_ANALYTICS_REPORTING_ENABLED: "false"
       GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-https://macrotrack.yeongmin.net/grafana/}
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
       POSTGRES_DB: ${POSTGRES_DB:-macrotrack}
       GRAFANA_DB_USER: ${GRAFANA_DB_USER:-grafana_reader}
       GRAFANA_DB_PASSWORD: ${GRAFANA_DB_PASSWORD}
