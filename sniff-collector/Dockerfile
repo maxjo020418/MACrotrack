@@ -12,6 +12,6 @@ RUN uv sync --frozen --no-dev
 COPY main.py ./
 COPY sniff_collector ./sniff_collector
 
-EXPOSE 8080
+EXPOSE 8888
 
 CMD ["uv", "run", "--frozen", "python", "main.py"]

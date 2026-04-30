@@ -10,7 +10,7 @@ services:
       GRAFANA_DB_PASSWORD: ${GRAFANA_DB_PASSWORD}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+      - ./deploy/postgres/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 10s
@@ -44,14 +44,12 @@ services:
       COLLECTOR_MAC_HASH_KEY: ${COLLECTOR_MAC_HASH_KEY}
       COLLECTOR_SSID_HASH_KEY: ${COLLECTOR_SSID_HASH_KEY}
     ports:
-      - "${COLLECTOR_PUBLIC_PORT:-8080}:8080"
+      - "${COLLECTOR_PUBLIC_PORT:-8888}:${COLLECTOR_PORT:-8888}"
     healthcheck:
       test:
         [
-          "CMD",
-          "python",
-          "-c",
-          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3).read()",
+          "CMD-SHELL",
+          "python -c \"import os, urllib.request; urllib.request.urlopen(f'http://127.0.0.1:{os.getenv(\\\"COLLECTOR_PORT\\\", \\\"8888\\\")}/health', timeout=3).read()\"",
         ]
       interval: 30s
       timeout: 5s
@@ -78,8 +76,8 @@ services:
       - "${GRAFANA_PUBLIC_PORT:-3000}:3000"
     volumes:
       - grafana_data:/var/lib/grafana
-      - ./grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
     healthcheck:
       test:
         [

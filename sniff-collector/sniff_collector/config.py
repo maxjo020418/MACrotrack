@@ -12,7 +12,7 @@ ENV_FILE = Path(os.getenv("COLLECTOR_ENV_FILE", Path(__file__).resolve().parents
 class Settings(BaseSettings):
     app_name: str = "sniff-collector"
     host: str = "0.0.0.0"
-    port: int = 8080
+    port: int = 8888
     log_level: str = "info"
     auth_required: bool = True
     api_tokens: str = ""
@@ -47,4 +47,3 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
-

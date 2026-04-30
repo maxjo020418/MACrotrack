@@ -33,7 +33,7 @@ uv run python main.py
 The sender default endpoint is:
 
 ```text
-POST http://<collector-host>:8080/api/sniff/batch
+POST http://<collector-host>:8888/api/sniff/batch
 Content-Type: application/octet-stream
 Authorization: Bearer <token>
 ```
@@ -52,7 +52,7 @@ The deployable stack lives in `deploy/`:
 
 ```sh
 cp ../deploy/.env.example ../deploy/.env
-docker compose -f ../deploy/docker-compose.yml --env-file ../deploy/.env up --build
+docker compose --project-directory .. -f ../deploy/docker-compose.yml --env-file ../deploy/.env up --build
 ```
 
 The compose file starts PostgreSQL and this service. The Python container is
