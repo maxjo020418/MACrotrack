@@ -6,9 +6,9 @@ datasources:
     type: postgres
     access: proxy
     url: postgres:5432
-    user: ${SERVICE_USER_GRAFANA_DB}
+    user: ${GRAFANA_DB_USER}
     secureJsonData:
-      password: ${SERVICE_PASSWORD_GRAFANA_DB}
+      password: ${GRAFANA_DB_PASSWORD}
     jsonData:
       database: ${POSTGRES_DB}
       sslmode: disable

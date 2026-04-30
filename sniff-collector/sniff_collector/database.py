@@ -17,8 +17,8 @@ def _database_url() -> str | URL:
         return settings.database_url
     return URL.create(
         "postgresql+psycopg",
-        username=settings.resolved_database_user,
-        password=settings.resolved_database_password,
+        username=settings.database_user,
+        password=settings.database_password,
         host=settings.database_host,
         port=settings.database_port,
         database=settings.database_name,
