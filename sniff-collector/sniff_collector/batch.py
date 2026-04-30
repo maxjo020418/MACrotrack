@@ -149,9 +149,12 @@ def unpack_named(fmt: str, fields: tuple[str, ...], data: bytes, offset: int) ->
 
 def magic_text(value: int, byteorder: str) -> str:
     try:
-        return value.to_bytes(4, byteorder).decode("ascii")
+        text = value.to_bytes(4, byteorder).decode("ascii")
     except UnicodeDecodeError:
         return f"0x{value:08x}"
+    if not text.isprintable():
+        return f"0x{value:08x}"
+    return text
 
 
 def add_magic_ascii(payload: dict[str, Any]) -> None:
@@ -311,4 +314,3 @@ def parse_batch_payload(data: bytes) -> dict[str, Any]:
     parsed["unparsed_payload_bytes"] = max(payload_end - offset, 0)
     parsed["trailing_body_bytes"] = max(len(data) - expected_body_len, 0)
     return parsed
-

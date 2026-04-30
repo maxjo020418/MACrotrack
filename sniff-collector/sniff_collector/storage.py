@@ -10,6 +10,7 @@ from .config import settings
 from .database import get_engine
 from .events import now_utc
 from .identity import ssid_values, upsert_mac, upsert_sender
+from .json_safety import sanitize_json
 from .models import ingest_batches, wifi_frame_payloads, wifi_frames
 from .wifi import is_local_admin_mac, parse_management_frame
 
@@ -50,7 +51,7 @@ def insert_ingest_batch(
                 sender_uptime_ms=header.get("uptime_ms"),
                 parse_ok=parsed is not None,
                 parse_error=parse_error,
-                sender_status=parsed.get("sender_status") if parsed else None,
+                sender_status=sanitize_json(parsed.get("sender_status")) if parsed else None,
                 raw_body=body if settings.store_raw_body else None,
             )
             .returning(ingest_batches.c.id)
@@ -153,8 +154,8 @@ def insert_frame(
             ssid_len=wifi.get("ssid_len"),
             ssid_is_wildcard=wifi.get("ssid_is_wildcard"),
             ie_ids=wifi.get("ie_ids") or [],
-            vendor_ouis=[oui.hex() for oui in wifi.get("vendor_ouis", [])],
-            fixed_fields=wifi.get("fixed_fields") or {},
+            vendor_ouis=sanitize_json([oui.hex() for oui in wifi.get("vendor_ouis", [])]),
+            fixed_fields=sanitize_json(wifi.get("fixed_fields") or {}),
             parse_ok=wifi.get("parse_ok", False),
             parse_error=wifi.get("parse_error"),
             is_station_originated=item["direction"]["is_station_originated"],
@@ -209,4 +210,3 @@ def persist_batch(
         "batch_id": batch_id,
         "frames_inserted": len(pending_frames),
     }
-
