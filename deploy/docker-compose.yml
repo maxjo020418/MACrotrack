@@ -50,6 +50,8 @@ services:
       COLLECTOR_SSID_HASH_KEY: ${COLLECTOR_SSID_HASH_KEY}
     expose:
       - "${COLLECTOR_PORT}"
+    ports:
+      - "${COLLECTOR_PUBLIC_PORT}:${COLLECTOR_PORT}"
     healthcheck:
       test:
         [
@@ -81,6 +83,8 @@ services:
       GRAFANA_DB_PASSWORD: ${GRAFANA_DB_PASSWORD}
     expose:
       - "3000"
+    ports:
+      - "${GRAFANA_PUBLIC_PORT}:3000"
     volumes:
       - grafana_data:/var/lib/grafana
       - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
