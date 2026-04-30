@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from sqlalchemy import create_engine, text
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Engine, URL
 
 from .config import settings
 from .models import metadata
@@ -12,12 +12,25 @@ from .models import metadata
 _engine: Engine | None = None
 
 
+def _database_url() -> str | URL:
+    if settings.database_url.strip():
+        return settings.database_url
+    return URL.create(
+        "postgresql+psycopg",
+        username=settings.database_user,
+        password=settings.database_password,
+        host=settings.database_host,
+        port=settings.database_port,
+        database=settings.database_name,
+    )
+
+
 def get_engine() -> Engine | None:
     global _engine
     if not settings.database_enabled:
         return None
     if _engine is None:
-        _engine = create_engine(settings.database_url, pool_pre_ping=True, future=True)
+        _engine = create_engine(_database_url(), pool_pre_ping=True, future=True)
     return _engine
 
 
@@ -62,4 +75,3 @@ def database_health() -> dict[str, Any]:
         return {"enabled": True, "ok": True}
     except Exception as exc:  # pragma: no cover - exact DB errors vary by driver
         return {"enabled": True, "ok": False, "error": str(exc)}
-

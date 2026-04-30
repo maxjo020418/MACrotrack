@@ -12,9 +12,11 @@ cp .env.example .env
 Set `COLLECTOR_API_TOKENS` to the same value as `API_TOKEN` in
 `esp32_sender/include/secrets.h`. Multiple tokens can be comma-separated.
 
-Set `COLLECTOR_DATABASE_URL` to enable DB writes. Leave it blank to keep the
-server in parser/logger mode. When DB writes are enabled, set long random values
-for `COLLECTOR_MAC_HASH_KEY` and `COLLECTOR_SSID_HASH_KEY`; MACs and SSIDs are
+Set `COLLECTOR_DATABASE_URL` to enable DB writes, or set
+`COLLECTOR_DATABASE_HOST`, `COLLECTOR_DATABASE_NAME`, `COLLECTOR_DATABASE_USER`,
+and `COLLECTOR_DATABASE_PASSWORD`. Leave both forms blank to keep the server in
+parser/logger mode. When DB writes are enabled, set long random values for
+`COLLECTOR_MAC_HASH_KEY` and `COLLECTOR_SSID_HASH_KEY`; MACs and SSIDs are
 stored as keyed hashes by default.
 
 Supported auth headers:

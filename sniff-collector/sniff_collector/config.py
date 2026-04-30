@@ -22,6 +22,11 @@ class Settings(BaseSettings):
     log_raw_body: bool = False
 
     database_url: str = ""
+    database_host: str = ""
+    database_port: int = 5432
+    database_name: str = ""
+    database_user: str = ""
+    database_password: str = ""
     auto_create_schema: bool = True
     store_raw_body: bool = False
     store_raw_frames: bool = True
@@ -43,7 +48,7 @@ class Settings(BaseSettings):
 
     @property
     def database_enabled(self) -> bool:
-        return bool(self.database_url.strip())
+        return bool(self.database_url.strip() or self.database_host.strip())
 
 
 settings = Settings()
