@@ -1032,6 +1032,8 @@ static bool beginUploadHttpClient(bool* reused) {
   if (uploadHttpBegun) {
     if (uploadHttpSecure != https) {
       closeUploadHttpClient();
+    } else if (!uploadHttp.connected()) {
+      closeUploadHttpClient();
     } else {
       if (reused != nullptr && uploadHttp.connected()) {
         *reused = true;
@@ -1439,6 +1441,8 @@ static bool postBatch(const uint8_t* data,
     *responseCodeOut = responseCode;
   }
   if (responseCode < 0) {
+    closeUploadHttpClient();
+  } else if (responseCode < 200 || responseCode >= 300) {
     closeUploadHttpClient();
   }
   logEvent(LogLevel::Warn,
