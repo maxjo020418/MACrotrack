@@ -308,7 +308,7 @@
           },
           "format": "time_series",
           "rawQuery": true,
-          "rawSql": "select $__timeGroupAlias(observed_at, '1 minute'), direction as metric, count(*)::bigint as value from wifi_frames where $__timeFilter(observed_at) group by 1, 2 order by 1;",
+          "rawSql": "select $__timeGroupAlias(observed_at, '1m'), direction as metric, count(*)::bigint as value from wifi_frames where $__timeFilter(observed_at) group by 1, 2 order by 1;",
           "refId": "A"
         }
       ],
@@ -418,4 +418,3 @@
   "uid": "macrotrack-collector-overview",
   "version": 1
 }
-
