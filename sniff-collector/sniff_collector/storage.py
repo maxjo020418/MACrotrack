@@ -4,6 +4,8 @@ import hashlib
 from datetime import timedelta
 from typing import Any
 
+from sqlalchemy import select
+
 from .classifier import classify_direction, is_known_ap, update_ap_evidence
 from .clock import unwrap_rx_timestamp
 from .config import settings
@@ -32,9 +34,19 @@ def insert_ingest_batch(
     body: bytes,
     parsed: dict[str, Any] | None,
     parse_error: str | None,
-) -> int:
+) -> tuple[int, bool]:
     header = parsed["header"] if parsed else {}
-    return int(
+    body_sha256 = hashlib.sha256(body).digest()
+    existing_id = conn.execute(
+        select(ingest_batches.c.id)
+        .where(ingest_batches.c.sender_id == sender_id)
+        .where(ingest_batches.c.body_sha256 == body_sha256)
+        .limit(1)
+    ).scalar_one_or_none()
+    if existing_id is not None:
+        return int(existing_id), True
+
+    batch_id = int(
         conn.execute(
             ingest_batches.insert()
             .values(
@@ -42,7 +54,7 @@ def insert_ingest_batch(
                 received_at=now_utc(),
                 client_host=request_meta.get("client_host"),
                 body_len=len(body),
-                body_sha256=hashlib.sha256(body).digest(),
+                body_sha256=body_sha256,
                 content_type=request_meta.get("content_type"),
                 batch_seq=header.get("batch_seq"),
                 declared_record_count=header.get("record_count"),
@@ -57,6 +69,7 @@ def insert_ingest_batch(
             .returning(ingest_batches.c.id)
         ).scalar_one()
     )
+    return batch_id, False
 
 
 def prepare_frame(
@@ -192,7 +205,21 @@ def persist_batch(
 
     with engine.begin() as conn:
         sender_id = upsert_sender(conn, device_id, now)
-        batch_id = insert_ingest_batch(conn, sender_id, request_meta, body, parsed, parse_error)
+        batch_id, duplicate = insert_ingest_batch(
+            conn,
+            sender_id,
+            request_meta,
+            body,
+            parsed,
+            parse_error,
+        )
+        if duplicate:
+            return {
+                "database_enabled": True,
+                "batch_id": batch_id,
+                "frames_inserted": 0,
+                "duplicate": True,
+            }
         if not parsed:
             return {"database_enabled": True, "batch_id": batch_id, "frames_inserted": 0}
 
@@ -209,4 +236,5 @@ def persist_batch(
         "database_enabled": True,
         "batch_id": batch_id,
         "frames_inserted": len(pending_frames),
+        "duplicate": False,
     }

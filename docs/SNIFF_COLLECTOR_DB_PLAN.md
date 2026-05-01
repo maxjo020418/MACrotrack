@@ -118,9 +118,11 @@ create table ingest_batches (
 );
 
 create index ingest_batches_received_at_idx on ingest_batches(received_at);
-create unique index ingest_batches_sender_seq_idx
-  on ingest_batches(sender_id, batch_seq)
-  where parse_ok;
+create index ingest_batches_sender_seq_idx
+  on ingest_batches(sender_id, batch_seq);
+
+create index ingest_batches_sender_body_sha_idx
+  on ingest_batches(sender_id, body_sha256);
 ```
 
 Keep `raw_body` nullable and controlled by config. It is useful for early debugging, but storing per-frame raw payloads is usually enough.

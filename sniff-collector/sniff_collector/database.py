@@ -41,6 +41,23 @@ def init_database() -> None:
 
     metadata.create_all(engine)
     with engine.begin() as conn:
+        conn.execute(text("drop index if exists ingest_batches_sender_seq_idx"))
+        conn.execute(
+            text(
+                """
+                create index if not exists ingest_batches_sender_seq_idx
+                on ingest_batches(sender_id, batch_seq)
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                create index if not exists ingest_batches_sender_body_sha_idx
+                on ingest_batches(sender_id, body_sha256)
+                """
+            )
+        )
         conn.execute(
             text(
                 """

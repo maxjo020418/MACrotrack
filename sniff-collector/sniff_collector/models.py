@@ -55,9 +55,8 @@ ingest_batches = Table(
         "ingest_batches_sender_seq_idx",
         "sender_id",
         "batch_seq",
-        unique=True,
-        postgresql_where=Column("parse_ok").is_(True),
     ),
+    Index("ingest_batches_sender_body_sha_idx", "sender_id", "body_sha256"),
 )
 
 mac_addresses = Table(
